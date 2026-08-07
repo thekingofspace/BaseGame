@@ -1,12 +1,15 @@
 const Flags = {
     NetworkResponse = {
-        OK = "flags.NetworkResponse.OK",
-        Recieved = "flags.NetworkResponse.Recieved",
-        Bad = "flags.NetworkResponse.Bad",
-        Debounced = "flags.NetworkResponse.Debounced",
+        OK = "",
+        Recieved = "",
+        Bad = "",
+        Debounced = "",
     }
 }
 for key, arg in pairs(Flags) do
+    for Code:string, _ in pairs(arg) do
+        arg[Code] = `Flags.{key}.{Code}`
+    end
     Flags[key] = table.freeze(arg)
 end
 table.freeze(Flags)
