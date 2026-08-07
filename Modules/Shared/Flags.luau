@@ -6,11 +6,8 @@ const Flags = {
         Debounced = "flags.NetworkResponse.Debounced",
     }
 }
-
 for key, arg in pairs(Flags) do
     Flags[key] = table.freeze(arg)
 end
-
 table.freeze(Flags)
-
 return Flags
