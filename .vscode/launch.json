@@ -14,13 +14,6 @@
       "request": "launch",
       "command": "rojo sourcemap default.project.json --output sourcemap.json --include-non-scripts --watch",
       "cwd": "${workspaceFolder}"
-    },
-    {
-      "name": "Rojo: Build (watch)",
-      "type": "node-terminal",
-      "request": "launch",
-      "command": "rojo build default.project.json --output BaseGame.rbxlx --watch",
-      "cwd": "${workspaceFolder}"
     }
   ],
   "compounds": [
