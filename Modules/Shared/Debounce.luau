@@ -88,7 +88,7 @@ const FEEDERS: {[string]:Feeder} = {
 }
 
 const function feedValue(a:number, b:number, value:any): (number, number)
-    const feeder = FEEDERS[typeof(value)] or feedOther
+    local feeder = FEEDERS[typeof(value)] or feedOther
     return feeder(a, b, value)
 end
 
