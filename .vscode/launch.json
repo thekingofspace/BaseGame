@@ -1,0 +1,33 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Rojo: Serve",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "rojo serve default.project.json",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Rojo: Sourcemap (watch)",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "rojo sourcemap default.project.json --output sourcemap.json --include-non-scripts --watch",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Rojo: Build (watch)",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "rojo build default.project.json --output BaseGame.rbxlx --watch",
+      "cwd": "${workspaceFolder}"
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Rojo: Serve + Sourcemap Watch",
+      "configurations": ["Rojo: Serve", "Rojo: Sourcemap (watch)"],
+      "stopAll": true
+    }
+  ]
+}
