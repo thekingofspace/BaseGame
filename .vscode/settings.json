@@ -1,0 +1,9 @@
+{
+  "workbench.colorCustomizations": {
+    "[Roblox Studio Dark Default]": {
+      "statusBar.debuggingBackground": "#191a1f",
+      "statusBar.debuggingForeground": "#bcbec8",
+      "statusBar.debuggingBorder": "#202227"
+    }
+  }
+}
