@@ -25,6 +25,12 @@ export type Frequency = {
     Level:string,
 }
 
+type Tally = {
+    Count:number,
+    Message:string,
+    Level:string,
+}
+
 export type MemorySink = Types.Sink & {
     Query:(self:MemorySink, query:Query?) -> {Types.Entry},
     All:(self:MemorySink) -> {Types.Entry},
@@ -98,7 +104,7 @@ end
 
 function Memory.Top(self:any, limit:number?):{Frequency}
     const out:{Frequency} = {}
-    for fingerprint, record in pairs(self._counts) do
+    for fingerprint, record in pairs(self._counts::{[string]:Tally}) do
         table.insert(out, {
             Fingerprint = fingerprint,
             Count = record.Count,
@@ -107,7 +113,7 @@ function Memory.Top(self:any, limit:number?):{Frequency}
         })
     end
 
-    table.sort(out, function(a, b)
+    table.sort(out, function(a:Frequency, b:Frequency)
         if a.Count == b.Count then
             return a.Message < b.Message
         end
@@ -127,7 +133,7 @@ function Memory.Dump(self:any, query:Query?):string
         return "<no matching entries>"
     end
 
-    const lines = {}
+    const lines:{string} = {}
     for index = #entries, 1, -1 do
         table.insert(lines, Console.Render(entries[index]))
     end

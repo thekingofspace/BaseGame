@@ -44,7 +44,7 @@ function FaultMeta.Root(self:any):any
 end
 
 function FaultMeta.Chain(self:any):{any}
-    const chain = {}
+    const chain:{any} = {}
     local current:any = self
     const seen:{[any]:boolean} = {}
     while current and not seen[current] do
@@ -56,7 +56,7 @@ function FaultMeta.Chain(self:any):{any}
 end
 
 function FaultMeta.ToString(self:any):string
-    const lines = {}
+    const lines:{string} = {}
 
     for index, fault in ipairs(FaultMeta.Chain(self)) do
         const prefix = if index == 1 then "" else string.rep("  ", index - 1) .. "caused by "
@@ -247,7 +247,7 @@ function AttemptMeta.Match(self:any, handlers:{[string]:any}):any
             table.insert(kinds, kind)
         end
     end
-    table.sort(kinds, function(a, b)
+    table.sort(kinds, function(a:string, b:string)
         return #a > #b
     end)
 

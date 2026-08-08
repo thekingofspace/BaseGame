@@ -189,7 +189,7 @@ end
 
 function Metrics.Format():string
     const snapshot = Metrics.Snapshot()
-    const lines = {}
+    const lines:{string} = {}
 
     const function section(title:string, names:{string})
         if #names == 0 then
@@ -213,7 +213,7 @@ function Metrics.Format():string
     end
 
     const function names(source:{[string]:any}):{string}
-        const out = {}
+        const out:{string} = {}
         for name in pairs(source) do
             table.insert(out, name)
         end

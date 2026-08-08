@@ -74,7 +74,7 @@ const function timestamp():string
 end
 
 const function headline(entry:Types.Entry, options:typeof(State.Console)):string
-    const parts = {}
+    const parts:{string} = {}
 
     if options.ShowTime then
         table.insert(parts, `[{timestamp()}]`)

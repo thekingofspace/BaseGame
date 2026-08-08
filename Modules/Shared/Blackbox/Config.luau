@@ -139,7 +139,7 @@ function Config.Configure(options:Types.Config)
     applyBool(State::any, "CaptureOutput", options.CaptureOutput)
 
     if options.RedactKeys then
-        const keys = {}
+        const keys:{string} = {}
         for _, key in ipairs(options.RedactKeys) do
             table.insert(keys, key:lower())
         end

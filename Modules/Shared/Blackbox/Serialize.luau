@@ -144,11 +144,11 @@ const function limitsFrom(options:Options?):Limits
 end
 
 const function sortedKeys(source:{[any]:any}):{any}
-    const keys = {}
+    const keys:{any} = {}
     for key in pairs(source) do
         table.insert(keys, key)
     end
-    table.sort(keys, function(a, b)
+    table.sort(keys, function(a:any, b:any)
         return tostring(a) < tostring(b)
     end)
     return keys
@@ -167,7 +167,7 @@ const function renderTable(value:{[any]:any}, limits:Limits, depth:number, seen:
 
     seen[value] = path
 
-    const parts = {}
+    const parts:{string} = {}
     local count = 0
     local skipped = 0
 
@@ -325,7 +325,7 @@ function Serialize.Sanitize(value:any, options:Options?):any
         end
 
         seen[current] = true
-        const out = {}
+        const out:{[string]:any} = {}
         local count = 0
         for key, item in pairs(current::{[any]:any}) do
             if count >= limits.MaxEntries then
