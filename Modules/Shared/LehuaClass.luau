@@ -1,86 +1,67 @@
 --!nocheck
 
--- The runtime signature of any class method. Methods are called as
--- `instance:Method(...)`, so they receive the instance as `self` (internally
--- the private fields table) followed by the caller's args, and return anything.
 export type Method = (self: any, ...any) -> ...any
 
--- A name -> value/function bag. This is the shape of the Public / Private /
--- Static / Meta tables you write inside a class declaration.
 export type MemberTable = { [string]: any }
 
--- A live instance as seen from outside (the "outer proxy"). It behaves like a
--- table of members, but every read/write is routed through the class's access
--- rules (privacy, strictness, static vs field), never raw table access.
 export type Object = { [string]: any }
 
--- A class "handle" returned by NewClassData. It is callable — `MyClass(...)`
--- builds an instance — and also indexes its Name and any Static members.
 export type Class = ((...any) -> Object) & { Name: string, [string]: any }
 
--- A structural contract produced by LehuaClass.Interface: a frozen, tagged
--- table listing the members a value must expose to satisfy it.
 export type Interface = {
-	__lehua: string, -- internal tag identifying this table as a Lehua interface
-	Name: string, -- human-readable name, shown in Implements/error messages
-	Requires: { [string]: string }, -- member name -> required type ("any" means presence is enough)
-	Extends: { Interface }, -- parent interfaces whose requirements are also demanded
+	__lehua: string,
+	Name: string,
+	Requires: { [string]: string },
+	Extends: { Interface },
 }
 
--- The spec you pass to LehuaClass.Interface. Requires can be a plain list of
--- member names (types default to "any") or a name -> expected-type map.
 export type InterfaceSpec = {
-	Name: string, -- name to give the new interface
-	Requires: { string } | { [string]: string }, -- required members, as a list or a name->type map
-	Extends: { Interface }?, -- optional parent interfaces to inherit requirements from
+	Name: string,
+	Requires: { string } | { [string]: string },
+	Extends: { Interface }?,
 }
 
--- One parent entry in a MULTIPLE-inheritance list. Single inheritance takes a
--- bare Class and copies everything; with several parents you must name exactly
--- which members to pull from each (per section) so diamonds stay unambiguous.
+export type Metadata = { [any]: any }
+
 export type InheritPick = {
-	Class: Class, -- the parent class to inherit from
-	Public: { string }?, -- names of the parent's public fields/methods to pull in
-	Private: { string }?, -- names of the parent's private fields/methods to pull in
-	Static: { string }?, -- names of the parent's statics to pull in
-	Meta: { string }?, -- names of the parent's metamethods to pull in
+	Class: Class,
+	Public: { string }?,
+	Private: { string }?,
+	Static: { string }?,
+	Meta: { string }?,
 }
 
--- The declaration table handed to NewClassData — the full description of a
--- class. Only Name is required. Lifecycle hooks (`__construct`, `__setup`) and
--- metamethods are written as extra `__`-prefixed keys at the top level, which
--- the open `[string]: any` index permits.
 export type ClassDecl = {
-	Name: string, -- unique class name; also the class's identity for IsA
-	Private: MemberTable?, -- members reachable only through this class's own methods via self
-	Public: MemberTable?, -- members visible from outside; function values become methods
-	Static: MemberTable?, -- members shared on the class (one copy for all instances)
-	Meta: MemberTable?, -- instance metamethods (__tostring, __add, ...)
-	Inherits: (Class | { InheritPick })?, -- a single parent class, or a list of picks for multiple inheritance
-	Interfaces: { Interface }?, -- interfaces the class must satisfy (verified at definition time)
-	Strict: boolean?, -- default true; when true, touching an undeclared member errors
-	Abstract: boolean?, -- when true, the class cannot be instantiated directly
-	Sealed: boolean?, -- when true, no other class may inherit from it
-	[string]: any, -- also carries the `__construct` / `__setup` / other `__meta` hooks
+	Name: string,
+	Private: MemberTable?,
+	Public: MemberTable?,
+	Static: MemberTable?,
+	Meta: MemberTable?,
+	Inherits: (Class | { InheritPick })?,
+	Interfaces: { Interface }?,
+	Strict: boolean?,
+	Abstract: boolean?,
+	Sealed: boolean?,
+	[string]: any,
 }
 
--- The module's public API (what `require(LehuaClass)` returns).
 export type LehuaClassModule = {
-	None: any, -- sentinel default meaning "no value"; a field set to None reads back as nil on an instance
-	NewClassData: (decl: ClassDecl) -> Class, -- define a class from a declaration and return its handle
-	BuildClassData: (class: Class, ...any) -> Object, -- construct an instance (identical to calling the class handle)
-	SuperGet: (class: Class, memberName: string) -> ((self: any, ...any) -> ...any), -- get a named ancestor method / __construct / __setup to invoke with an instance (super calls)
-	Interface: (spec: InterfaceSpec) -> Interface, -- build an Interface contract from a spec
-	Implements: (value: any, iface: Interface) -> (boolean, { string }), -- test a value/class/instance against an interface; returns ok plus the list of missing members
-	IsA: (value: any, classOrName: Class | string) -> boolean, -- does the value derive from the given class or class name (walks the ancestor set)
-	FetchClass: (value: any) -> Class?, -- resolve the class handle for an instance, a class, or a class-name string
-	IsClass: (value: any) -> boolean, -- true if the value is a class handle
-	IsInstance: (value: any) -> boolean, -- true if the value is a built instance
-	Ref: (value: any) -> Object?, -- normalize an inner fields table or proxy to the canonical outer proxy (a stable identity key)
-	IsInterface: (value: any) -> boolean, -- true if the value is a Lehua interface
-	TypeOf: (value: any) -> string, -- class name for instances, "class"/"interface" for those, else Roblox typeof
-	Inspect: (value: any) -> string, -- multi-line debug dump of an instance's public fields, methods, and statics
-	Globalize: (target: MemberTable?) -> LehuaClassModule, -- copy the core constructors into a table (or _G) so they can be used unqualified
+	None: any,
+	NewClassData: (decl: ClassDecl) -> Class,
+	BuildClassData: (class: Class, ...any) -> Object,
+	SuperGet: (class: Class, memberName: string) -> ((self: any, ...any) -> ...any),
+	Interface: (spec: InterfaceSpec) -> Interface,
+	Implements: (value: any, iface: Interface) -> (boolean, { string }),
+	IsA: (value: any, classOrName: Class | string) -> boolean,
+	FetchClass: (value: any) -> Class?,
+	GetMetaData: (value: any) -> Metadata,
+	IsClass: (value: any) -> boolean,
+	IsInstance: (value: any) -> boolean,
+	Ref: (value: any) -> Object?,
+	IsInterface: (value: any) -> boolean,
+	TypeOf: (value: any) -> string,
+	Inspect: (value: any) -> string,
+	Globalize: (target: MemberTable?) -> LehuaClassModule,
 }
 
 local LehuaClass = {}
@@ -142,6 +123,39 @@ local function instantiateValue(v: any): any
 		return nil
 	end
 	return deepCopy(v, {})
+end
+
+local function mergeMetadata(into: Metadata, from: Metadata)
+	local count = #from
+
+	for i = 1, count do
+		local value = from[i]
+		local duplicate = false
+		for j = 1, #into do
+			if into[j] == value then
+				duplicate = true
+				break
+			end
+		end
+		if not duplicate then
+			table.insert(into, value)
+		end
+	end
+
+	for k, v in pairs(from) do
+		local isArrayEntry = type(k) == "number" and k % 1 == 0 and k >= 1 and k <= count
+		if not isArrayEntry then
+			local existing = into[k]
+			if type(existing) == "table" and type(v) == "table" then
+				local merged = {}
+				mergeMetadata(merged, existing)
+				mergeMetadata(merged, v)
+				into[k] = merged
+			else
+				into[k] = v
+			end
+		end
+	end
 end
 
 local function unwrapOne(v: any): any
@@ -577,6 +591,13 @@ local function absorbMeta(def: any, key: string, value: any, className: string)
 		def.setup = value
 		return
 	end
+	if key == "__metadata" then
+		if type(value) ~= "table" then
+			error(("class '%s': __metadata must be a table"):format(className), 3)
+		end
+		def.ownMetadata = value
+		return
+	end
 	if key ~= "__type" and type(value) ~= "function" then
 		error(("class '%s': metamethod '%s' must be a function"):format(className, key), 3)
 	end
@@ -655,6 +676,8 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 		construct = nil,
 		setup = nil,
 		setups = {},
+		metadata = {},
+		ownMetadata = nil,
 		interfaces = {},
 		ancestors = {},
 		ancestorNames = {},
@@ -678,6 +701,7 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 				appendSetup(def.setups, setupFn)
 			end
 			table.insert(def.staticParents, singleParent)
+			mergeMetadata(def.metadata, singleParent.metadata)
 			for h in pairs(singleParent.ancestors) do def.ancestors[h] = true end
 			for n in pairs(singleParent.ancestorNames) do def.ancestorNames[n] = true end
 			for _, iface in ipairs(singleParent.interfaces) do
@@ -728,6 +752,7 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 						def.ownStatics[name] = v
 					end
 				end
+				mergeMetadata(def.metadata, parentDef.metadata)
 				for h in pairs(parentDef.ancestors) do def.ancestors[h] = true end
 				for n in pairs(parentDef.ancestorNames) do def.ancestorNames[n] = true end
 				for _, setupFn in ipairs(parentDef.setups) do
@@ -759,6 +784,11 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 	if def.setup ~= nil then
 		appendSetup(def.setups, def.setup)
 	end
+
+	if def.ownMetadata ~= nil then
+		mergeMetadata(def.metadata, def.ownMetadata)
+	end
+	table.freeze(def.metadata)
 
 	local function collide(k: string)
 		error(("class '%s': member '%s' is declared both private and public"):format(className, k), 2)
@@ -955,6 +985,23 @@ function LehuaClass.FetchClass(value: any): Class?
 		return classesByName[value]
 	end
 	return nil
+end
+
+function LehuaClass.GetMetaData(value: any): Metadata
+	local def = resolveInstance(value)
+	if def == nil then
+		def = handleToDef[value]
+	end
+	if def == nil and type(value) == "string" then
+		local named = classesByName[value]
+		if named ~= nil then
+			def = handleToDef[named]
+		end
+	end
+	if def == nil then
+		error("GetMetaData expects a class, an instance, or a class name", 2)
+	end
+	return def.metadata
 end
 
 function LehuaClass.IsClass(value: any): boolean
