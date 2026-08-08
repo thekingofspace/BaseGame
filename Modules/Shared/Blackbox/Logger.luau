@@ -20,7 +20,7 @@ const Logger = {}
 Logger.__index = Logger
 
 const Throttler = Throttle.new()
-const Breadcrumbs = Ring.new(State.BreadcrumbLimit)
+const Breadcrumbs = (Ring.new(State.BreadcrumbLimit)::any)::Ring.Ring<Types.Breadcrumb>
 const History = Sinks.Memory(State.HistoryLimit, Level.TRACE)
 
 const Registry:{[string]:any} = {}
@@ -100,7 +100,7 @@ const function collectSinks(self:any):{Types.Sink}
 
     local node = self
     while node do
-        for _, sink in ipairs(node._sinks) do
+        for _, sink in ipairs(node._sinks::{Types.Sink}) do
             if not seen[sink] then
                 seen[sink] = true
                 table.insert(out, sink)
@@ -139,7 +139,7 @@ end
 const function runHooks(self:any, entry:Types.Entry):boolean
     local node = self
     while node do
-        for _, hook in ipairs(node._hooks) do
+        for _, hook in ipairs(node._hooks::{Types.Hook}) do
             const ok, verdict = pcall(hook, entry)
             if ok and verdict == false then
                 return false
@@ -468,9 +468,10 @@ function Logger.Destroy(self:any)
     end
     self._destroyed = true
 
-    for _, sink in ipairs(self._sinks) do
-        if sink.Close then
-            pcall(sink.Close, sink)
+    for _, sink in ipairs(self._sinks::{Types.Sink}) do
+        const close = sink.Close
+        if close then
+            pcall(close, sink)
         end
     end
     table.clear(self._sinks)
