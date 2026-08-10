@@ -1,4 +1,5 @@
 --!nocheck
+--!native
 
 export type Method = (self: any, ...any) -> ...any
 
@@ -58,6 +59,7 @@ export type LehuaClassModule = {
 	IsClass: (value: any) -> boolean,
 	IsInstance: (value: any) -> boolean,
 	Ref: (value: any) -> Object?,
+	GetTopLevel: (value: any) -> Object,
 	IsInterface: (value: any) -> boolean,
 	TypeOf: (value: any) -> string,
 	Inspect: (value: any) -> string,
@@ -1024,6 +1026,22 @@ function LehuaClass.Ref(value: any): Object?
 		return outer
 	end
 	return nil
+end
+
+function LehuaClass.GetTopLevel(value: any): Object
+	if type(value) == "table" then
+		if outerToRecord[value] ~= nil then
+			return value
+		end
+		local outer = innerToOuter[value]
+		if outer ~= nil then
+			return outer
+		end
+		if innerToDef[value] ~= nil then
+			error("GetTopLevel: this instance's public handle is no longer alive", 2)
+		end
+	end
+	error("GetTopLevel expects an instance created by BuildClassData", 2)
 end
 
 LehuaClass.IsInterface = isInterface
