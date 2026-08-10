@@ -30,10 +30,25 @@ local BUFFER_MAX = 64
 local OUTBOX_TTL = 30
 local OUTBOX_MAX = 64
 
+type Pending = {
+	expires: number,
+	resolved: boolean,
+	onResolve: (...any) -> (),
+}
+
+local pending: { [number]: Pending } = {}
+
+local MAX_PROMISE = 65535
+
 local nextPromise = 0
 
 local function newPromise(): number
-	nextPromise = (nextPromise % 4294967294) + 1
+	for _ = 1, MAX_PROMISE do
+		nextPromise = (nextPromise % MAX_PROMISE) + 1
+		if pending[nextPromise] == nil then
+			return nextPromise
+		end
+	end
 	return nextPromise
 end
 
@@ -54,14 +69,6 @@ local listeners: { [string]: { (...any) -> () } } = {}
 type Orphan = { at: number, args: { n: number, [number]: any } }
 
 local orphaned: { [string]: { Orphan } } = {}
-
-type Pending = {
-	expires: number,
-	resolved: boolean,
-	onResolve: (...any) -> (),
-}
-
-local pending: { [number]: Pending } = {}
 
 type Buffered = { at: number, bucket: number, args: { n: number, [number]: any } }
 
