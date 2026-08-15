@@ -35,6 +35,13 @@ export type ControlSpec = {
 	Set: Method?,
 }
 
+export type ValueFactory = {
+	__lehua: string,
+	Make: (...any) -> any,
+	Args: { any },
+	Count: number,
+}
+
 export type InheritPick = {
 	Class: Class,
 	Public: { string }?,
@@ -134,6 +141,8 @@ export type LehuaClassModule = {
 	TraitsOf: (value: any) -> { Trait },
 	ControlSpecifier: (spec: ControlSpec) -> Control,
 	IsControl: (value: any) -> boolean,
+	SetValue: (factory: (...any) -> any, ...any) -> any,
+	IsSetValue: (value: any) -> boolean,
 	ControlsOf: (value: any) -> { [string]: string },
 	Fuse: (...MemberTable) -> MemberTable,
 	SourceOf: (value: any, memberName: string) -> string?,
@@ -221,6 +230,7 @@ local LehuaClass = {}
 local INTERFACE_TAG = "LehuaClass.Interface"
 local TRAIT_TAG = "LehuaClass.Trait"
 local CONTROL_TAG = "LehuaClass.Control"
+local SETVALUE_TAG = "LehuaClass.SetValue"
 
 local None = table.freeze(setmetatable({}, table.freeze({
 	__tostring = function()
@@ -261,7 +271,7 @@ local function deepCopy(value: any, seen: { [any]: any }): any
 		return value
 	end
 	local tag = rawget(value, "__lehua")
-	if tag == INTERFACE_TAG or tag == TRAIT_TAG or tag == CONTROL_TAG then
+	if tag == INTERFACE_TAG or tag == TRAIT_TAG or tag == CONTROL_TAG or tag == SETVALUE_TAG then
 		return value
 	end
 	local hit = seen[value]
@@ -276,9 +286,32 @@ local function deepCopy(value: any, seen: { [any]: any }): any
 	return setmetatable(out, getmetatable(value))
 end
 
+local function isSetValue(v: any): boolean
+	return type(v) == "table" and rawget(v, "__lehua") == SETVALUE_TAG
+end
+
+function LehuaClass.SetValue(factory: (...any) -> any, ...: any): any
+	if type(factory) ~= "function" then
+		error("SetValue expects a function that produces the value", 2)
+	end
+	local packed = table.pack(...)
+	return table.freeze({
+		__lehua = SETVALUE_TAG,
+		Make = factory,
+		Args = table.freeze(table.move(packed, 1, packed.n, 1, {})),
+		Count = packed.n,
+	}) :: any
+end
+
+LehuaClass.IsSetValue = isSetValue
+
 local function instantiateValue(v: any): any
 	if v == None then
 		return nil
+	end
+	if isSetValue(v) then
+		local made = v :: ValueFactory
+		return made.Make(table.unpack(made.Args, 1, made.Count))
 	end
 	return deepCopy(v, {})
 end
@@ -737,6 +770,9 @@ local function classProbe(def: ClassDef): Probe
 		end
 		local fv = def.pubFields[name]
 		if fv ~= nil then
+			if isSetValue(fv) then
+				return true, "any"
+			end
 			return true, fv == None and "nil" or type(fv)
 		end
 		local sv = staticLookup(def, name)
@@ -907,6 +943,14 @@ local function copyMergedMembers(traitName: string, src: any, label: string): Me
 			error(
 				("trait '%s': metamethod '%s' belongs at the top level of the trait, not inside %s"):format(
 					traitName, k, label
+				),
+				3
+			)
+		end
+		if isSetValue(v) then
+			error(
+				("trait '%s': %s member '%s' cannot be a SetValue — merged members fuse declared tables"):format(
+					traitName, label, k
 				),
 				3
 			)
@@ -1089,6 +1133,9 @@ local function traitProbe(def: ClassDef): Probe
 		end
 		local fv = def.privFields[name]
 		if fv ~= nil then
+			if isSetValue(fv) then
+				return true, "any"
+			end
 			return true, fv == None and "nil" or type(fv)
 		end
 		return public(name)
@@ -1833,6 +1880,14 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 			if type(name) ~= "string" then
 				error(("class '%s': %s member names must be strings"):format(className, label), 2)
 			end
+			if isSetValue(value) then
+				error(
+					("class '%s': %s member '%s' cannot be a SetValue — merged members fuse declared tables"):format(
+						className, label, name
+					),
+					2
+				)
+			end
 			if type(value) ~= "table" then
 				error(
 					("class '%s': %s member '%s' must be a table — merged members fuse their contents"):format(
@@ -1891,6 +1946,14 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 	for k, v in pairs(assertMemberTable(className, decl.Static, "Static")) do
 		if type(k) ~= "string" then
 			error(("class '%s': Static member names must be strings"):format(className), 2)
+		end
+		if isSetValue(v) then
+			error(
+				("class '%s': static '%s' cannot be a SetValue — statics are built once, so call the function yourself"):format(
+					className, k
+				),
+				2
+			)
 		end
 		def.ownStatics[k] = v
 	end
