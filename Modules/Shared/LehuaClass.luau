@@ -32,6 +32,46 @@ export type InheritPick = {
 	Meta: { string }?,
 }
 
+export type Trait = {
+	__lehua: string,
+	Name: string,
+	Public: MemberTable,
+	Private: MemberTable,
+	Static: MemberTable,
+	Meta: MemberTable,
+	Metadata: Metadata,
+	Requires: { [string]: string },
+	Setups: { Method },
+	Readies: { Method },
+	Uses: { Trait },
+}
+
+export type TraitSpec = {
+	Name: string,
+	Public: MemberTable?,
+	Private: MemberTable?,
+	Static: MemberTable?,
+	Meta: MemberTable?,
+	Requires: ({ string } | { [string]: string })?,
+	Uses: { Trait }?,
+	[string]: any,
+}
+
+export type TraitPick = {
+	Trait: Trait,
+	Only: { string }?,
+	Except: { string }?,
+	Rename: { [string]: string }?,
+}
+
+export type DelegateSpec = {
+	To: string,
+	Methods: ({ string } | { [string]: string })?,
+	Fields: ({ string } | { [string]: string })?,
+	Getters: ({ string } | { [string]: string })?,
+	Optional: boolean?,
+}
+
 export type ClassDecl = {
 	Name: string,
 	Private: MemberTable?,
@@ -39,6 +79,8 @@ export type ClassDecl = {
 	Static: MemberTable?,
 	Meta: MemberTable?,
 	Inherits: (Class | { InheritPick })?,
+	Traits: { Trait | TraitPick }?,
+	Delegates: { DelegateSpec }?,
 	Interfaces: { Interface }?,
 	Strict: boolean?,
 	Abstract: boolean?,
@@ -53,6 +95,12 @@ export type LehuaClassModule = {
 	SuperGet: (class: Class, memberName: string) -> ((self: any, ...any) -> ...any),
 	Interface: (spec: InterfaceSpec) -> Interface,
 	Implements: (value: any, iface: Interface) -> (boolean, { string }),
+	Trait: (spec: TraitSpec) -> Trait,
+	Compose: (name: string, ...Trait) -> Trait,
+	Delegate: (spec: DelegateSpec) -> MemberTable,
+	IsTrait: (value: any) -> boolean,
+	HasTrait: (value: any, traitOrName: Trait | string) -> boolean,
+	TraitsOf: (value: any) -> { Trait },
 	IsA: (value: any, classOrName: Class | string) -> boolean,
 	FetchClass: (value: any) -> Class?,
 	GetMetaData: (value: any) -> Metadata,
@@ -69,6 +117,7 @@ export type LehuaClassModule = {
 local LehuaClass = {}
 
 local INTERFACE_TAG = "LehuaClass.Interface"
+local TRAIT_TAG = "LehuaClass.Trait"
 
 local None = table.freeze(setmetatable({}, table.freeze({
 	__tostring = function()
@@ -106,6 +155,10 @@ local function deepCopy(value: any, seen: { [any]: any }): any
 		return value
 	end
 	if value == None or outerToRecord[value] ~= nil or handleToDef[value] ~= nil then
+		return value
+	end
+	local tag = rawget(value, "__lehua")
+	if tag == INTERFACE_TAG or tag == TRAIT_TAG then
 		return value
 	end
 	local hit = seen[value]
@@ -158,6 +211,15 @@ local function mergeMetadata(into: Metadata, from: Metadata)
 			end
 		end
 	end
+end
+
+local function appendHook(list: { any }, fn: any)
+	for _, existing in ipairs(list) do
+		if existing == fn then
+			return
+		end
+	end
+	table.insert(list, fn)
 end
 
 local function unwrapOne(v: any): any
@@ -256,6 +318,7 @@ end
 local SPECIAL_META = {
 	__construct = true,
 	__setup = true,
+	__ready = true,
 	__tostring = true,
 	__type = true,
 	__toconsole = true,
@@ -490,9 +553,9 @@ local function instanceProbe(def: any, fields: any, rec: any): (name: string) ->
 	end
 end
 
-local function checkInterface(probe: (name: string) -> (boolean, string), iface: Interface): (boolean, { string })
+local function checkMembers(probe: (name: string) -> (boolean, string), requires: { [string]: string }): (boolean, { string })
 	local missing = {}
-	for member, expected in pairs(gatherRequirements(iface, {}, {})) do
+	for member, expected in pairs(requires) do
 		local present, valueType = probe(member)
 		if not present then
 			table.insert(missing, ("%s (missing)"):format(member))
@@ -502,6 +565,10 @@ local function checkInterface(probe: (name: string) -> (boolean, string), iface:
 	end
 	table.sort(missing)
 	return #missing == 0, missing
+end
+
+local function checkInterface(probe: (name: string) -> (boolean, string), iface: Interface): (boolean, { string })
+	return checkMembers(probe, gatherRequirements(iface, {}, {}))
 end
 
 function LehuaClass.Implements(value: any, iface: Interface): (boolean, { string })
@@ -532,6 +599,494 @@ function LehuaClass.Implements(value: any, iface: Interface): (boolean, { string
 	return false, { "(value is not a table, instance, or class)" }
 end
 
+local function isTrait(v: any): boolean
+	return type(v) == "table" and rawget(v, "__lehua") == TRAIT_TAG
+end
+
+local function normalizeNameMap(context: string, label: string, src: any, default: string?): { [string]: string }
+	local out = {}
+	if src == nil then
+		return out
+	end
+	if type(src) ~= "table" then
+		error(("%s: %s must be a list of names or a { name = target } map"):format(context, label), 4)
+	end
+	for k, v in pairs(src) do
+		if type(k) == "number" then
+			if type(v) ~= "string" then
+				error(("%s: %s entries must be member-name strings"):format(context, label), 4)
+			end
+			out[v] = default or v
+		elseif type(k) == "string" then
+			if type(v) ~= "string" then
+				error(("%s: %s entry '%s' must map to a string"):format(context, label, k), 4)
+			end
+			out[k] = v
+		else
+			error(("%s: %s has an invalid key of type %s"):format(context, label, type(k)), 4)
+		end
+	end
+	return out
+end
+
+local KNOWN_TRAIT_KEYS = {
+	Name = true,
+	Public = true,
+	Private = true,
+	Static = true,
+	Meta = true,
+	Requires = true,
+	Uses = true,
+}
+
+local function copyTraitMembers(traitName: string, src: any, label: string): MemberTable
+	if src == nil then
+		return {}
+	end
+	if type(src) ~= "table" then
+		error(("trait '%s': %s must be a table"):format(traitName, label), 3)
+	end
+	local out = {}
+	for k, v in pairs(src) do
+		if type(k) ~= "string" then
+			error(("trait '%s': %s member names must be strings"):format(traitName, label), 3)
+		end
+		if k:sub(1, 2) == "__" then
+			error(
+				("trait '%s': metamethod '%s' belongs at the top level of the trait, not inside %s"):format(
+					traitName, k, label
+				),
+				3
+			)
+		end
+		out[k] = v
+	end
+	return out
+end
+
+local function absorbTraitMeta(draft: any, key: string, value: any, traitName: string)
+	if RESERVED_META[key] then
+		error(("trait '%s': metamethod '%s' is reserved by LehuaClass"):format(traitName, key), 3)
+	end
+	if key == "__construct" then
+		error(
+			("trait '%s': traits cannot define __construct — use __setup or __ready so several traits can stack"):format(
+				traitName
+			),
+			3
+		)
+	end
+	if key == "__setup" or key == "__ready" then
+		if type(value) ~= "function" then
+			error(("trait '%s': %s must be a function"):format(traitName, key), 3)
+		end
+		table.insert(key == "__setup" and draft.Setups or draft.Readies, value)
+		return
+	end
+	if key == "__metadata" then
+		if type(value) ~= "table" then
+			error(("trait '%s': __metadata must be a table"):format(traitName), 3)
+		end
+		mergeMetadata(draft.Metadata, value)
+		return
+	end
+	if key ~= "__type" and type(value) ~= "function" then
+		error(("trait '%s': metamethod '%s' must be a function"):format(traitName, key), 3)
+	end
+	draft.Meta[key] = value
+end
+
+function LehuaClass.Trait(spec: TraitSpec): Trait
+	if type(spec) ~= "table" then
+		error("Trait expects a table { Name = ..., Public = { ... } }", 2)
+	end
+	if type(spec.Name) ~= "string" or spec.Name == "" then
+		error("Trait requires a non-empty string Name", 2)
+	end
+	local traitName = spec.Name
+	for k in pairs(spec) do
+		if type(k) ~= "string" or (not KNOWN_TRAIT_KEYS[k] and k:sub(1, 2) ~= "__") then
+			error(("trait '%s': unknown declaration key '%s'"):format(traitName, tostring(k)), 2)
+		end
+	end
+
+	local uses = {}
+	if spec.Uses ~= nil then
+		if type(spec.Uses) ~= "table" then
+			error(("trait '%s': Uses must be a list of traits"):format(traitName), 2)
+		end
+		for i, used in ipairs(spec.Uses) do
+			if not isTrait(used) then
+				error(("trait '%s': Uses[%d] is not a Trait"):format(traitName, i), 2)
+			end
+			uses[i] = used
+		end
+	end
+
+	local draft = {
+		Meta = {},
+		Metadata = {},
+		Setups = {},
+		Readies = {},
+	}
+
+	local public = copyTraitMembers(traitName, spec.Public, "Public")
+	local private = copyTraitMembers(traitName, spec.Private, "Private")
+	local static = copyTraitMembers(traitName, spec.Static, "Static")
+
+	for k in pairs(private) do
+		if public[k] ~= nil then
+			error(("trait '%s': member '%s' is declared both private and public"):format(traitName, k), 2)
+		end
+	end
+
+	if spec.Meta ~= nil then
+		if type(spec.Meta) ~= "table" then
+			error(("trait '%s': Meta must be a table"):format(traitName), 2)
+		end
+		for k, v in pairs(spec.Meta) do
+			if type(k) ~= "string" then
+				error(("trait '%s': Meta keys must be strings"):format(traitName), 2)
+			end
+			absorbTraitMeta(draft, k, v, traitName)
+		end
+	end
+	for k, v in pairs(spec) do
+		if type(k) == "string" and k:sub(1, 2) == "__" then
+			absorbTraitMeta(draft, k, v, traitName)
+		end
+	end
+
+	return table.freeze({
+		__lehua = TRAIT_TAG,
+		Name = traitName,
+		Public = table.freeze(public),
+		Private = table.freeze(private),
+		Static = table.freeze(static),
+		Meta = table.freeze(draft.Meta),
+		Metadata = table.freeze(draft.Metadata),
+		Requires = table.freeze(
+			normalizeNameMap(("trait '%s'"):format(traitName), "Requires", spec.Requires, "any")
+		),
+		Setups = table.freeze(draft.Setups),
+		Readies = table.freeze(draft.Readies),
+		Uses = table.freeze(uses),
+	})
+end
+
+function LehuaClass.Compose(name: string, ...: Trait): Trait
+	if type(name) ~= "string" or name == "" then
+		error("Compose expects a name followed by the traits to merge", 2)
+	end
+	local given = table.pack(...)
+	if given.n == 0 then
+		error(("Compose '%s': needs at least one trait"):format(name), 2)
+	end
+	for i = 1, given.n do
+		if not isTrait(given[i]) then
+			error(("Compose '%s': argument %d is not a Trait"):format(name, i + 1), 2)
+		end
+	end
+	return LehuaClass.Trait({
+		Name = name,
+		Uses = table.move(given, 1, given.n, 1, {}),
+	})
+end
+
+local function flattenTrait(trait: Trait, out: { Trait }, seen: { [any]: boolean })
+	if seen[trait] then
+		return
+	end
+	seen[trait] = true
+	for _, used in ipairs(trait.Uses) do
+		flattenTrait(used, out, seen)
+	end
+	table.insert(out, trait)
+end
+
+local function traitProbe(def: any): (name: string) -> (boolean, string)
+	local public = classProbe(def)
+	return function(name)
+		if def.privMethods[name] ~= nil then
+			return true, "function"
+		end
+		local fv = def.privFields[name]
+		if fv ~= nil then
+			return true, fv == None and "nil" or type(fv)
+		end
+		return public(name)
+	end
+end
+
+local TRAIT_PICK_KEYS = {
+	Trait = true,
+	Only = true,
+	Except = true,
+	Rename = true,
+}
+
+local function traitEntry(className: string, entry: any, index: number): (Trait, { [string]: boolean }?, { [string]: boolean }?, { [string]: string }?)
+	if isTrait(entry) then
+		return entry, nil, nil, nil
+	end
+	if type(entry) ~= "table" then
+		error(("class '%s': Traits[%d] must be a Trait or { Trait = ..., Only = {...} }"):format(className, index), 4)
+	end
+	for k in pairs(entry) do
+		if not TRAIT_PICK_KEYS[k] then
+			error(("class '%s': Traits[%d] has unknown key '%s'"):format(className, index, tostring(k)), 4)
+		end
+	end
+	if not isTrait(entry.Trait) then
+		error(("class '%s': Traits[%d].Trait is not a Trait"):format(className, index), 4)
+	end
+
+	local sets = {}
+	for _, label in ipairs({ "Only", "Except" }) do
+		local list = entry[label]
+		if list ~= nil then
+			if type(list) ~= "table" then
+				error(("class '%s': Traits[%d].%s must be a list of member names"):format(className, index, label), 4)
+			end
+			local set = {}
+			for _, name in ipairs(list) do
+				if type(name) ~= "string" then
+					error(("class '%s': Traits[%d].%s must contain strings"):format(className, index, label), 4)
+				end
+				set[name] = true
+			end
+			sets[label] = set
+		end
+	end
+
+	local rename = entry.Rename
+	if rename ~= nil then
+		if type(rename) ~= "table" then
+			error(("class '%s': Traits[%d].Rename must be a { from = to } map"):format(className, index), 4)
+		end
+		for from, to in pairs(rename) do
+			if type(from) ~= "string" or type(to) ~= "string" then
+				error(
+					("class '%s': Traits[%d].Rename entries must map a member name to a member name"):format(
+						className, index
+					),
+					4
+				)
+			end
+		end
+	end
+
+	return entry.Trait, sets.Only, sets.Except, rename
+end
+
+local function checkFilterNames(className: string, index: number, traitName: string, available: { [string]: boolean }, names: any, label: string)
+	if names == nil then
+		return
+	end
+	for name in pairs(names) do
+		if not available[name] then
+			error(
+				("class '%s': Traits[%d].%s names '%s', which trait '%s' does not provide"):format(
+					className, index, label, tostring(name), traitName
+				),
+				4
+			)
+		end
+	end
+end
+
+local function routeTraitMembers(className: string, traitName: string, src: MemberTable, filter: any, owner: { [string]: string }, fieldsDst: MemberTable, methodsDst: MemberTable?, label: string, declared: { [string]: boolean })
+	local only, except, rename = filter.only, filter.except, filter.rename
+	for key, value in pairs(src) do
+		if (only == nil or only[key]) and (except == nil or not except[key]) then
+			local name = (rename ~= nil and rename[key]) or key
+			local previous = owner[name]
+			if previous ~= nil and previous ~= traitName and not declared[name] then
+				error(
+					("class '%s': traits '%s' and '%s' both provide %s '%s' — declare '%s' on the class, or filter one with Only/Except/Rename"):format(
+						className, previous, traitName, label, name, name
+					),
+					4
+				)
+			end
+			owner[name] = traitName
+			if methodsDst == nil then
+				fieldsDst[name] = value
+			elseif type(value) == "function" then
+				methodsDst[name] = value
+				fieldsDst[name] = nil
+			else
+				fieldsDst[name] = value
+				methodsDst[name] = nil
+			end
+		end
+	end
+end
+
+local function applyTraits(def: any, decl: ClassDecl, className: string, declared: { [string]: boolean })
+	local list = decl.Traits
+	if list == nil then
+		return
+	end
+	if type(list) ~= "table" then
+		error(("class '%s': Traits must be a list of traits"):format(className), 3)
+	end
+
+	local applied = {}
+	for _, trait in ipairs(def.traits) do
+		applied[trait] = true
+	end
+
+	local memberOwner, staticOwner, metaOwner = {}, {}, {}
+
+	for index, entry in ipairs(list) do
+		local trait, only, except, rename = traitEntry(className, entry, index)
+
+		local group = {}
+		flattenTrait(trait, group, {})
+
+		if only ~= nil or except ~= nil or rename ~= nil then
+			local available = {}
+			for _, member in ipairs(group) do
+				for k in pairs(member.Public) do available[k] = true end
+				for k in pairs(member.Private) do available[k] = true end
+				for k in pairs(member.Static) do available[k] = true end
+			end
+			checkFilterNames(className, index, trait.Name, available, only, "Only")
+			checkFilterNames(className, index, trait.Name, available, except, "Except")
+			checkFilterNames(className, index, trait.Name, available, rename, "Rename")
+		end
+
+		local filter = { only = only, except = except, rename = rename }
+
+		for _, member in ipairs(group) do
+			if not applied[member] then
+				applied[member] = true
+				table.insert(def.traits, member)
+
+				routeTraitMembers(className, member.Name, member.Public, filter, memberOwner, def.pubFields, def.pubMethods, "member", declared)
+				routeTraitMembers(className, member.Name, member.Private, filter, memberOwner, def.privFields, def.privMethods, "member", declared)
+				routeTraitMembers(className, member.Name, member.Static, filter, staticOwner, def.ownStatics, nil, "static", declared)
+
+				for key, fn in pairs(member.Meta) do
+					local previous = metaOwner[key]
+					if previous ~= nil and previous ~= member.Name and not declared[key] then
+						error(
+							("class '%s': traits '%s' and '%s' both provide metamethod '%s' — declare '%s' on the class to resolve it"):format(
+								className, previous, member.Name, key, key
+							),
+							3
+						)
+					end
+					metaOwner[key] = member.Name
+					def.meta[key] = fn
+				end
+
+				for _, setupFn in ipairs(member.Setups) do
+					appendHook(def.setups, setupFn)
+				end
+				for _, readyFn in ipairs(member.Readies) do
+					appendHook(def.readies, readyFn)
+				end
+				mergeMetadata(def.metadata, member.Metadata)
+			end
+		end
+	end
+end
+
+local DELEGATE_KEYS = {
+	To = true,
+	Methods = true,
+	Fields = true,
+	Getters = true,
+	Optional = true,
+}
+
+local function makeDelegate(context: string, spec: any): MemberTable
+	if type(spec) ~= "table" then
+		error(("%s: Delegate expects a table { To = ..., Methods = {...} }"):format(context), 3)
+	end
+	for k in pairs(spec) do
+		if not DELEGATE_KEYS[k] then
+			error(("%s: unknown Delegate key '%s'"):format(context, tostring(k)), 3)
+		end
+	end
+	local to = spec.To
+	if type(to) ~= "string" or to == "" then
+		error(("%s: Delegate requires a To member name"):format(context), 3)
+	end
+
+	local optional = spec.Optional == true
+	local methods = normalizeNameMap(context, "Delegate Methods", spec.Methods, nil)
+	local fields = normalizeNameMap(context, "Delegate Fields", spec.Fields, nil)
+	local getters = normalizeNameMap(context, "Delegate Getters", spec.Getters, nil)
+
+	local out = {}
+	local function put(name: string, fn: Method)
+		if out[name] ~= nil then
+			error(("%s: delegate would define '%s' twice"):format(context, name), 4)
+		end
+		out[name] = fn
+	end
+
+	local function reach(selfArg: any, memberName: string): any
+		local target = selfArg[to]
+		if target == nil then
+			if optional then
+				return nil
+			end
+			error(("'%s' cannot run — delegate target '%s' is nil"):format(memberName, to), 3)
+		end
+		return target
+	end
+
+	for exposed, remote in pairs(methods) do
+		put(exposed, function(selfArg, ...)
+			local target = reach(selfArg, exposed)
+			if target == nil then
+				return nil
+			end
+			local fn = target[remote]
+			if type(fn) ~= "function" then
+				error(("delegate '%s' expected a method '%s' on '%s'"):format(exposed, remote, to), 2)
+			end
+			return fn(target, ...)
+		end)
+	end
+
+	local function putGetter(exposed: string, remote: string)
+		local getName = "Get" .. exposed
+		put(getName, function(selfArg)
+			local target = reach(selfArg, getName)
+			if target == nil then
+				return nil
+			end
+			return target[remote]
+		end)
+	end
+
+	for exposed, remote in pairs(fields) do
+		putGetter(exposed, remote)
+		local setName = "Set" .. exposed
+		put(setName, function(selfArg, value)
+			local target = reach(selfArg, setName)
+			if target ~= nil then
+				target[remote] = value
+			end
+		end)
+	end
+
+	for exposed, remote in pairs(getters) do
+		putGetter(exposed, remote)
+	end
+
+	return out
+end
+
+function LehuaClass.Delegate(spec: DelegateSpec): MemberTable
+	return makeDelegate("Delegate", spec)
+end
+
 local KNOWN_DECL_KEYS = {
 	Name = true,
 	Private = true,
@@ -539,6 +1094,8 @@ local KNOWN_DECL_KEYS = {
 	Static = true,
 	Meta = true,
 	Inherits = true,
+	Traits = true,
+	Delegates = true,
 	Interfaces = true,
 	Strict = true,
 	Abstract = true,
@@ -593,6 +1150,13 @@ local function absorbMeta(def: any, key: string, value: any, className: string)
 		def.setup = value
 		return
 	end
+	if key == "__ready" then
+		if type(value) ~= "function" then
+			error(("class '%s': __ready must be a function"):format(className), 3)
+		end
+		def.ready = value
+		return
+	end
 	if key == "__metadata" then
 		if type(value) ~= "table" then
 			error(("class '%s': __metadata must be a table"):format(className), 3)
@@ -637,15 +1201,6 @@ local function pickMembers(className: string, parentDef: any, names: { string }?
 	end
 end
 
-local function appendSetup(list: { any }, fn: any)
-	for _, existing in ipairs(list) do
-		if existing == fn then
-			return
-		end
-	end
-	table.insert(list, fn)
-end
-
 function LehuaClass.NewClassData(decl: ClassDecl): Class
 	if type(decl) ~= "table" then
 		error("NewClassData expects a declaration table", 2)
@@ -678,9 +1233,12 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 		construct = nil,
 		setup = nil,
 		setups = {},
+		ready = nil,
+		readies = {},
 		metadata = {},
 		ownMetadata = nil,
 		interfaces = {},
+		traits = {},
 		ancestors = {},
 		ancestorNames = {},
 		boundCache = {},
@@ -700,7 +1258,10 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 			for k, v in pairs(singleParent.meta) do def.meta[k] = v end
 			def.construct = singleParent.construct
 			for _, setupFn in ipairs(singleParent.setups) do
-				appendSetup(def.setups, setupFn)
+				appendHook(def.setups, setupFn)
+			end
+			for _, readyFn in ipairs(singleParent.readies) do
+				appendHook(def.readies, readyFn)
 			end
 			table.insert(def.staticParents, singleParent)
 			mergeMetadata(def.metadata, singleParent.metadata)
@@ -708,6 +1269,9 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 			for n in pairs(singleParent.ancestorNames) do def.ancestorNames[n] = true end
 			for _, iface in ipairs(singleParent.interfaces) do
 				table.insert(def.interfaces, iface)
+			end
+			for _, trait in ipairs(singleParent.traits) do
+				table.insert(def.traits, trait)
 			end
 		elseif type(inherits) == "table" then
 			for i, entry in ipairs(inherits) do
@@ -758,11 +1322,64 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 				for h in pairs(parentDef.ancestors) do def.ancestors[h] = true end
 				for n in pairs(parentDef.ancestorNames) do def.ancestorNames[n] = true end
 				for _, setupFn in ipairs(parentDef.setups) do
-					appendSetup(def.setups, setupFn)
+					appendHook(def.setups, setupFn)
+				end
+				for _, readyFn in ipairs(parentDef.readies) do
+					appendHook(def.readies, readyFn)
 				end
 			end
 		else
 			error(("class '%s': Inherits must be a class or a list of { Class = ... } entries"):format(className), 2)
+		end
+	end
+
+	local declaredKeys = {}
+	local function noteDeclared(source: any)
+		if type(source) == "table" then
+			for k in pairs(source) do
+				if type(k) == "string" then
+					declaredKeys[k] = true
+				end
+			end
+		end
+	end
+	noteDeclared(decl.Private)
+	noteDeclared(decl.Public)
+	noteDeclared(decl.Static)
+	noteDeclared(decl.Meta)
+	for k in pairs(decl) do
+		if type(k) == "string" and k:sub(1, 2) == "__" then
+			declaredKeys[k] = true
+		end
+	end
+
+	applyTraits(def, decl, className, declaredKeys)
+
+	if decl.Delegates ~= nil then
+		if type(decl.Delegates) ~= "table" then
+			error(("class '%s': Delegates must be a list of delegate specs"):format(className), 2)
+		end
+		local delegated = {}
+		for i, spec in ipairs(decl.Delegates) do
+			local generated = makeDelegate(("class '%s': Delegates[%d]"):format(className, i), spec)
+			for name, fn in pairs(generated) do
+				if delegated[name] then
+					error(("class '%s': Delegates[%d] redefines delegated member '%s'"):format(className, i, name), 2)
+				end
+				if declaredKeys[name] then
+					error(
+						("class '%s': '%s' is both declared on the class and delegated — remove one"):format(
+							className, name
+						),
+						2
+					)
+				end
+				delegated[name] = true
+				def.pubMethods[name] = fn
+				def.pubFields[name] = nil
+				def.privFields[name] = nil
+				def.privMethods[name] = nil
+			end
 		end
 	end
 
@@ -784,7 +1401,10 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 	end
 
 	if def.setup ~= nil then
-		appendSetup(def.setups, def.setup)
+		appendHook(def.setups, def.setup)
+	end
+	if def.ready ~= nil then
+		appendHook(def.readies, def.ready)
 	end
 
 	if def.ownMetadata ~= nil then
@@ -807,6 +1427,22 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 	for k in pairs(def.privMethods) do def.privateKeySet[k] = true end
 	def.publicFieldSet = {}
 	for k in pairs(def.pubFields) do def.publicFieldSet[k] = true end
+
+	if #def.traits > 0 then
+		local needs = traitProbe(def)
+		for _, trait in ipairs(def.traits) do
+			local ok, missing = checkMembers(needs, trait.Requires)
+			if not ok then
+				error(
+					("class '%s' is missing what trait '%s' requires: %s"):format(
+						className, trait.Name, table.concat(missing, ", ")
+					),
+					2
+				)
+			end
+		end
+	end
+	table.freeze(def.traits)
 
 	if decl.Interfaces ~= nil then
 		if type(decl.Interfaces) ~= "table" then
@@ -922,6 +1558,9 @@ function LehuaClass.BuildClassData(classHandle: Class, ...: any): Object
 	if def.construct ~= nil then
 		def.construct(fields, ...)
 	end
+	for _, readyFn in ipairs(def.readies) do
+		readyFn(fields, ...)
+	end
 	return proxy
 end
 
@@ -940,6 +1579,11 @@ function LehuaClass.SuperGet(classHandle: Class, memberName: string): (self: any
 		fn = def.setup
 		if fn == nil then
 			error(("SuperGet: class '%s' has no __setup"):format(def.name), 2)
+		end
+	elseif memberName == "__ready" then
+		fn = def.ready
+		if fn == nil then
+			error(("SuperGet: class '%s' has no __ready"):format(def.name), 2)
 		end
 	elseif def.pubMethods[memberName] ~= nil then
 		fn = def.pubMethods[memberName]
@@ -1045,6 +1689,45 @@ function LehuaClass.GetTopLevel(value: any): Object
 end
 
 LehuaClass.IsInterface = isInterface
+LehuaClass.IsTrait = isTrait
+
+function LehuaClass.HasTrait(value: any, traitOrName: Trait | string): boolean
+	local def = resolveInstance(value)
+	if def == nil then
+		def = handleToDef[value]
+	end
+	if def == nil then
+		return false
+	end
+	if type(traitOrName) == "string" then
+		for _, trait in ipairs(def.traits) do
+			if trait.Name == traitOrName then
+				return true
+			end
+		end
+		return false
+	end
+	if not isTrait(traitOrName) then
+		error("HasTrait expects a Trait or a trait name as its second argument", 2)
+	end
+	for _, trait in ipairs(def.traits) do
+		if trait == traitOrName then
+			return true
+		end
+	end
+	return false
+end
+
+function LehuaClass.TraitsOf(value: any): { Trait }
+	local def = resolveInstance(value)
+	if def == nil then
+		def = handleToDef[value]
+	end
+	if def == nil then
+		return {}
+	end
+	return table.clone(def.traits)
+end
 
 function LehuaClass.TypeOf(value: any): string
 	local def, fields = resolveInstance(value)
@@ -1062,6 +1745,9 @@ function LehuaClass.TypeOf(value: any): string
 	end
 	if isInterface(value) then
 		return "interface"
+	end
+	if isTrait(value) then
+		return "trait"
 	end
 	return typeof(value)
 end
@@ -1096,6 +1782,13 @@ function LehuaClass.Inspect(value: any): string
 	for _, k in ipairs(sortedKeys(def.ownStatics)) do
 		table.insert(lines, ("  %s = %s (static)"):format(k, tostring(def.ownStatics[k])))
 	end
+	if #def.traits > 0 then
+		local names = {}
+		for _, trait in ipairs(def.traits) do
+			table.insert(names, trait.Name)
+		end
+		table.insert(lines, "  uses: " .. table.concat(names, ", "))
+	end
 	if #def.interfaces > 0 then
 		local names = {}
 		for _, iface in ipairs(def.interfaces) do
@@ -1109,6 +1802,7 @@ end
 local LEHUA_GLOBALS = {
 	"NewClassData", "BuildClassData", "SuperGet",
 	"Interface", "Implements", "IsA", "FetchClass",
+	"Trait", "Compose", "Delegate", "HasTrait",
 }
 
 function LehuaClass.Globalize(target: MemberTable?): LehuaClassModule
