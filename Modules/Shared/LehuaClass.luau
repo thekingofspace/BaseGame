@@ -1,4 +1,4 @@
---!nocheck
+--!strict
 --!native
 
 export type Method = (self: any, ...any) -> ...any
@@ -114,6 +114,59 @@ export type LehuaClassModule = {
 	Globalize: (target: MemberTable?) -> LehuaClassModule,
 }
 
+type ClassDef = {
+	name: string,
+	strict: boolean,
+	abstract: boolean,
+	sealed: boolean,
+	privFields: MemberTable,
+	privMethods: MemberTable,
+	pubFields: MemberTable,
+	pubMethods: MemberTable,
+	ownStatics: MemberTable,
+	staticParents: { ClassDef },
+	meta: MemberTable,
+	construct: Method?,
+	setup: Method?,
+	setups: { Method },
+	ready: Method?,
+	readies: { Method },
+	metadata: Metadata,
+	ownMetadata: Metadata?,
+	interfaces: { Interface },
+	traits: { Trait },
+	ancestors: { [any]: boolean },
+	ancestorNames: { [string]: boolean },
+	boundCache: MemberTable,
+	privateKeySet: MemberTable,
+	publicFieldSet: MemberTable,
+	handle: Class,
+	innerMeta: any,
+	outerMeta: any,
+}
+
+type InstanceRecord = {
+	def: ClassDef,
+	fields: MemberTable,
+	extraPublic: MemberTable,
+	id: number,
+}
+
+type TraitDraft = {
+	Meta: MemberTable,
+	Metadata: Metadata,
+	Setups: { Method },
+	Readies: { Method },
+}
+
+type TraitFilter = {
+	only: { [string]: boolean }?,
+	except: { [string]: boolean }?,
+	rename: { [string]: string }?,
+}
+
+type Probe = (name: string) -> (boolean, string)
+
 local LehuaClass = {}
 
 local INTERFACE_TAG = "LehuaClass.Interface"
@@ -126,11 +179,11 @@ local None = table.freeze(setmetatable({}, table.freeze({
 })))
 LehuaClass.None = None
 
-local handleToDef = setmetatable({}, { __mode = "k" })
-local outerToRecord = setmetatable({}, { __mode = "k" })
-local innerToOuter = setmetatable({}, { __mode = "kv" })
-local innerToDef = setmetatable({}, { __mode = "k" })
-local classesByName = setmetatable({}, { __mode = "v" })
+local handleToDef: { [any]: ClassDef } = setmetatable({}, { __mode = "k" }) :: any
+local outerToRecord: { [any]: InstanceRecord } = setmetatable({}, { __mode = "k" }) :: any
+local innerToOuter: { [any]: any } = setmetatable({}, { __mode = "kv" }) :: any
+local innerToDef: { [any]: ClassDef } = setmetatable({}, { __mode = "k" }) :: any
+local classesByName: { [string]: Class } = setmetatable({}, { __mode = "v" }) :: any
 
 local instanceCounter = 0
 
@@ -142,7 +195,7 @@ local function wordList(t: { string }): string
 end
 
 local function sortedKeys(map: { [string]: any }): { string }
-	local keys = {}
+	local keys: { string } = {}
 	for k in pairs(map) do
 		table.insert(keys, tostring(k))
 	end
@@ -165,7 +218,7 @@ local function deepCopy(value: any, seen: { [any]: any }): any
 	if hit ~= nil then
 		return hit
 	end
-	local out = {}
+	local out: { [any]: any } = {}
 	seen[value] = out
 	for k, v in pairs(value) do
 		out[deepCopy(k, seen)] = deepCopy(v, seen)
@@ -256,9 +309,9 @@ local function rewrapResults(...: any): ...any
 	return table.unpack(out, 1, n)
 end
 
-local function resolveInstance(value: any): (any, any, any)
+local function resolveInstance(value: any): (ClassDef?, MemberTable?, InstanceRecord?)
 	if type(value) ~= "table" then
-		return nil
+		return nil, nil, nil
 	end
 	local rec = outerToRecord[value]
 	if rec ~= nil then
@@ -275,16 +328,17 @@ local function resolveInstance(value: any): (any, any, any)
 	if def ~= nil then
 		return def, value, nil
 	end
-	return nil
+	return nil, nil, nil
 end
 
-local function staticLookup(def: any, key: string): any
+local function staticLookup(def: ClassDef, key: string): any
 	local v = def.ownStatics[key]
 	if v ~= nil then
 		return v
 	end
-	for _, parent in ipairs(def.staticParents) do
-		v = staticLookup(parent, key)
+	local parents = def.staticParents
+	for i = 1, #parents do
+		v = staticLookup(parents[i], key)
 		if v ~= nil then
 			return v
 		end
@@ -292,21 +346,22 @@ local function staticLookup(def: any, key: string): any
 	return nil
 end
 
-local function makeBound(def: any, name: string): Method
-	return function(selfArg, ...)
-		local rec = type(selfArg) == "table" and outerToRecord[selfArg] or nil
-		if rec == nil then
+local function makeBound(def: ClassDef, name: string): Method
+	return function(selfArg: any, ...): ...any
+		local found = type(selfArg) == "table" and outerToRecord[selfArg] or nil
+		if found == nil then
 			error(
 				("%s.%s is a method — call it as instance:%s(...)"):format(def.name, name, name),
 				2
 			)
 		end
+		local rec = found :: InstanceRecord
 		local impl = rec.def.pubMethods[name] or def.pubMethods[name]
 		return rewrapResults(impl(rec.fields, ...))
 	end
 end
 
-local function getBound(def: any, name: string): Method
+local function getBound(def: ClassDef, name: string): Method
 	local cached = def.boundCache[name]
 	if cached == nil then
 		cached = makeBound(def, name)
@@ -342,11 +397,11 @@ local function wrapMetamethod(fn: Method): Method
 	end
 end
 
-local function buildOuterMeta(def: any)
-	local meta = {}
+local function buildOuterMeta(def: ClassDef): MemberTable
+	local meta: MemberTable = {}
 
-	meta.__index = function(proxy, key)
-		local rec = outerToRecord[proxy]
+	meta.__index = function(proxy: any, key: string): any
+		local rec = outerToRecord[proxy] :: InstanceRecord
 		if def.pubMethods[key] ~= nil then
 			return getBound(def, key)
 		end
@@ -376,8 +431,8 @@ local function buildOuterMeta(def: any)
 		return nil
 	end
 
-	meta.__newindex = function(proxy, key, value)
-		local rec = outerToRecord[proxy]
+	meta.__newindex = function(proxy: any, key: string, value: any)
+		local rec = outerToRecord[proxy] :: InstanceRecord
 		if def.privateKeySet[key] then
 			error(("cannot write private member '%s.%s' from outside"):format(def.name, tostring(key)), 2)
 		end
@@ -406,13 +461,13 @@ local function buildOuterMeta(def: any)
 		rec.fields[key] = value
 	end
 
-	meta.__tostring = function(proxy)
-		local rec = outerToRecord[proxy]
-		local custom = def.meta.__tostring
+	meta.__tostring = function(proxy: any): string
+		local rec = outerToRecord[proxy] :: InstanceRecord
+		local custom: Method? = def.meta["__tostring"]
 		if custom ~= nil then
 			return tostring(custom(rec.fields))
 		end
-		return def.name .. "#" .. rec.id
+		return def.name .. "#" .. tostring(rec.id)
 	end
 
 	meta.__metatable = "The metatable is locked"
@@ -426,16 +481,16 @@ local function buildOuterMeta(def: any)
 	return meta
 end
 
-local function buildInnerMeta(def: any)
+local function buildInnerMeta(def: ClassDef): MemberTable
 	return {
-		__index = function(_, key)
+		__index = function(_: any, key: string): any
 			local m = def.pubMethods[key] or def.privMethods[key]
 			if m ~= nil then
 				return m
 			end
 			return staticLookup(def, key)
 		end,
-		__tostring = function(fields)
+		__tostring = function(fields: any): string
 			local outer = innerToOuter[fields]
 			if outer ~= nil then
 				return tostring(outer)
@@ -452,35 +507,37 @@ function LehuaClass.Interface(spec: InterfaceSpec): Interface
 	if type(spec.Name) ~= "string" or spec.Name == "" then
 		error("Interface requires a non-empty string Name", 2)
 	end
+	local ifaceName: string = spec.Name
 	if type(spec.Requires) ~= "table" then
-		error(("Interface '%s' requires a Requires table"):format(spec.Name), 2)
+		error(("Interface '%s' requires a Requires table"):format(ifaceName), 2)
 	end
 
-	local requires = {}
-	for k, v in pairs(spec.Requires) do
+	local requires: { [string]: string } = {}
+	local declared: any = spec.Requires
+	for k, v in pairs(declared) do
 		if type(k) == "number" then
 			if type(v) ~= "string" then
-				error(("Interface '%s': Requires entries must be member-name strings"):format(spec.Name), 2)
+				error(("Interface '%s': Requires entries must be member-name strings"):format(ifaceName), 2)
 			end
 			requires[v] = "any"
 		elseif type(k) == "string" then
 			if type(v) ~= "string" then
-				error(("Interface '%s': expected type for '%s' must be a string"):format(spec.Name, k), 2)
+				error(("Interface '%s': expected type for '%s' must be a string"):format(ifaceName::any, k), 2)
 			end
 			requires[k] = v
 		else
-			error(("Interface '%s': invalid Requires key of type %s"):format(spec.Name, type(k)), 2)
+			error(("Interface '%s': invalid Requires key of type %s"):format(ifaceName, type(k)), 2)
 		end
 	end
 
-	local extends = {}
+	local extends: { Interface } = {}
 	if spec.Extends ~= nil then
 		if type(spec.Extends) ~= "table" then
-			error(("Interface '%s': Extends must be a list of interfaces"):format(spec.Name), 2)
+			error(("Interface '%s': Extends must be a list of interfaces"):format(ifaceName), 2)
 		end
 		for i, parent in ipairs(spec.Extends) do
 			if type(parent) ~= "table" or parent.__lehua ~= INTERFACE_TAG then
-				error(("Interface '%s': Extends[%d] is not an Interface"):format(spec.Name, i), 2)
+				error(("Interface '%s': Extends[%d] is not an Interface"):format(ifaceName, i), 2)
 			end
 			extends[i] = parent
 		end
@@ -488,10 +545,10 @@ function LehuaClass.Interface(spec: InterfaceSpec): Interface
 
 	return table.freeze({
 		__lehua = INTERFACE_TAG,
-		Name = spec.Name,
+		Name = ifaceName,
 		Requires = table.freeze(requires),
 		Extends = table.freeze(extends),
-	})
+	}) :: any
 end
 
 local function isInterface(v: any): boolean
@@ -512,7 +569,7 @@ local function gatherRequirements(iface: Interface, out: { [string]: string }, s
 	return out
 end
 
-local function classProbe(def: any): (name: string) -> (boolean, string)
+local function classProbe(def: ClassDef): Probe
 	return function(name)
 		if def.pubMethods[name] ~= nil then
 			return true, "function"
@@ -533,7 +590,7 @@ local function classProbe(def: any): (name: string) -> (boolean, string)
 	end
 end
 
-local function instanceProbe(def: any, fields: any, rec: any): (name: string) -> (boolean, string)
+local function instanceProbe(def: ClassDef, fields: any, rec: InstanceRecord?): Probe
 	return function(name)
 		if def.pubMethods[name] ~= nil then
 			return true, "function"
@@ -553,8 +610,8 @@ local function instanceProbe(def: any, fields: any, rec: any): (name: string) ->
 	end
 end
 
-local function checkMembers(probe: (name: string) -> (boolean, string), requires: { [string]: string }): (boolean, { string })
-	local missing = {}
+local function checkMembers(probe: Probe, requires: { [string]: string }): (boolean, { string })
+	local missing: { string } = {}
 	for member, expected in pairs(requires) do
 		local present, valueType = probe(member)
 		if not present then
@@ -567,7 +624,7 @@ local function checkMembers(probe: (name: string) -> (boolean, string), requires
 	return #missing == 0, missing
 end
 
-local function checkInterface(probe: (name: string) -> (boolean, string), iface: Interface): (boolean, { string })
+local function checkInterface(probe: Probe, iface: Interface): (boolean, { string })
 	return checkMembers(probe, gatherRequirements(iface, {}, {}))
 end
 
@@ -604,7 +661,7 @@ local function isTrait(v: any): boolean
 end
 
 local function normalizeNameMap(context: string, label: string, src: any, default: string?): { [string]: string }
-	local out = {}
+	local out: { [string]: string } = {}
 	if src == nil then
 		return out
 	end
@@ -646,7 +703,7 @@ local function copyTraitMembers(traitName: string, src: any, label: string): Mem
 	if type(src) ~= "table" then
 		error(("trait '%s': %s must be a table"):format(traitName, label), 3)
 	end
-	local out = {}
+	local out: MemberTable = {}
 	for k, v in pairs(src) do
 		if type(k) ~= "string" then
 			error(("trait '%s': %s member names must be strings"):format(traitName, label), 3)
@@ -664,7 +721,7 @@ local function copyTraitMembers(traitName: string, src: any, label: string): Mem
 	return out
 end
 
-local function absorbTraitMeta(draft: any, key: string, value: any, traitName: string)
+local function absorbTraitMeta(draft: TraitDraft, key: string, value: any, traitName: string)
 	if RESERVED_META[key] then
 		error(("trait '%s': metamethod '%s' is reserved by LehuaClass"):format(traitName, key), 3)
 	end
@@ -710,7 +767,7 @@ function LehuaClass.Trait(spec: TraitSpec): Trait
 		end
 	end
 
-	local uses = {}
+	local uses: { Trait } = {}
 	if spec.Uses ~= nil then
 		if type(spec.Uses) ~= "table" then
 			error(("trait '%s': Uses must be a list of traits"):format(traitName), 2)
@@ -723,7 +780,7 @@ function LehuaClass.Trait(spec: TraitSpec): Trait
 		end
 	end
 
-	local draft = {
+	local draft: TraitDraft = {
 		Meta = {},
 		Metadata = {},
 		Setups = {},
@@ -771,7 +828,7 @@ function LehuaClass.Trait(spec: TraitSpec): Trait
 		Setups = table.freeze(draft.Setups),
 		Readies = table.freeze(draft.Readies),
 		Uses = table.freeze(uses),
-	})
+	}) :: any
 end
 
 function LehuaClass.Compose(name: string, ...: Trait): Trait
@@ -782,14 +839,17 @@ function LehuaClass.Compose(name: string, ...: Trait): Trait
 	if given.n == 0 then
 		error(("Compose '%s': needs at least one trait"):format(name), 2)
 	end
+	local uses: { Trait } = {}
 	for i = 1, given.n do
-		if not isTrait(given[i]) then
+		local candidate = given[i]
+		if not isTrait(candidate) then
 			error(("Compose '%s': argument %d is not a Trait"):format(name, i + 1), 2)
 		end
+		uses[i] = candidate
 	end
 	return LehuaClass.Trait({
 		Name = name,
-		Uses = table.move(given, 1, given.n, 1, {}),
+		Uses = uses,
 	})
 end
 
@@ -804,7 +864,7 @@ local function flattenTrait(trait: Trait, out: { Trait }, seen: { [any]: boolean
 	table.insert(out, trait)
 end
 
-local function traitProbe(def: any): (name: string) -> (boolean, string)
+local function traitProbe(def: ClassDef): Probe
 	local public = classProbe(def)
 	return function(name)
 		if def.privMethods[name] ~= nil then
@@ -841,14 +901,14 @@ local function traitEntry(className: string, entry: any, index: number): (Trait,
 		error(("class '%s': Traits[%d].Trait is not a Trait"):format(className, index), 4)
 	end
 
-	local sets = {}
+	local sets: { [string]: { [string]: boolean } } = {}
 	for _, label in ipairs({ "Only", "Except" }) do
 		local list = entry[label]
 		if list ~= nil then
 			if type(list) ~= "table" then
 				error(("class '%s': Traits[%d].%s must be a list of member names"):format(className, index, label), 4)
 			end
-			local set = {}
+			local set: { [string]: boolean } = {}
 			for _, name in ipairs(list) do
 				if type(name) ~= "string" then
 					error(("class '%s': Traits[%d].%s must contain strings"):format(className, index, label), 4)
@@ -879,11 +939,12 @@ local function traitEntry(className: string, entry: any, index: number): (Trait,
 	return entry.Trait, sets.Only, sets.Except, rename
 end
 
-local function checkFilterNames(className: string, index: number, traitName: string, available: { [string]: boolean }, names: any, label: string)
+local function checkFilterNames(className: string, index: number, traitName: string, available: { [string]: boolean }, names: { [string]: any }?, label: string)
 	if names == nil then
 		return
 	end
-	for name in pairs(names) do
+	local wanted = names :: { [string]: any }
+	for name in pairs(wanted) do
 		if not available[name] then
 			error(
 				("class '%s': Traits[%d].%s names '%s', which trait '%s' does not provide"):format(
@@ -895,7 +956,7 @@ local function checkFilterNames(className: string, index: number, traitName: str
 	end
 end
 
-local function routeTraitMembers(className: string, traitName: string, src: MemberTable, filter: any, owner: { [string]: string }, fieldsDst: MemberTable, methodsDst: MemberTable?, label: string, declared: { [string]: boolean })
+local function routeTraitMembers(className: string, traitName: string, src: MemberTable, filter: TraitFilter, owner: { [string]: string }, fieldsDst: MemberTable, methodsDst: MemberTable?, label: string, declared: { [string]: boolean })
 	local only, except, rename = filter.only, filter.except, filter.rename
 	for key, value in pairs(src) do
 		if (only == nil or only[key]) and (except == nil or not except[key]) then
@@ -923,30 +984,32 @@ local function routeTraitMembers(className: string, traitName: string, src: Memb
 	end
 end
 
-local function applyTraits(def: any, decl: ClassDecl, className: string, declared: { [string]: boolean })
-	local list = decl.Traits
-	if list == nil then
+local function applyTraits(def: ClassDef, decl: ClassDecl, className: string, declared: { [string]: boolean })
+	if decl.Traits == nil then
 		return
 	end
-	if type(list) ~= "table" then
+	if type(decl.Traits) ~= "table" then
 		error(("class '%s': Traits must be a list of traits"):format(className), 3)
 	end
+	local entries: { any } = decl.Traits :: any
 
-	local applied = {}
+	local applied: { [any]: boolean } = {}
 	for _, trait in ipairs(def.traits) do
 		applied[trait] = true
 	end
 
-	local memberOwner, staticOwner, metaOwner = {}, {}, {}
+	local memberOwner: { [string]: string } = {}
+	local staticOwner: { [string]: string } = {}
+	local metaOwner: { [string]: string } = {}
 
-	for index, entry in ipairs(list) do
+	for index, entry in ipairs(entries) do
 		local trait, only, except, rename = traitEntry(className, entry, index)
 
-		local group = {}
+		local group: { Trait } = {}
 		flattenTrait(trait, group, {})
 
 		if only ~= nil or except ~= nil or rename ~= nil then
-			local available = {}
+			local available: { [string]: boolean } = {}
 			for _, member in ipairs(group) do
 				for k in pairs(member.Public) do available[k] = true end
 				for k in pairs(member.Private) do available[k] = true end
@@ -957,7 +1020,7 @@ local function applyTraits(def: any, decl: ClassDecl, className: string, declare
 			checkFilterNames(className, index, trait.Name, available, rename, "Rename")
 		end
 
-		local filter = { only = only, except = except, rename = rename }
+		local filter: TraitFilter = { only = only, except = except, rename = rename }
 
 		for _, member in ipairs(group) do
 			if not applied[member] then
@@ -1011,17 +1074,18 @@ local function makeDelegate(context: string, spec: any): MemberTable
 			error(("%s: unknown Delegate key '%s'"):format(context, tostring(k)), 3)
 		end
 	end
-	local to = spec.To
-	if type(to) ~= "string" or to == "" then
+	local target = spec.To
+	if type(target) ~= "string" or target == "" then
 		error(("%s: Delegate requires a To member name"):format(context), 3)
 	end
+	local to: string = target
 
 	local optional = spec.Optional == true
 	local methods = normalizeNameMap(context, "Delegate Methods", spec.Methods, nil)
 	local fields = normalizeNameMap(context, "Delegate Fields", spec.Fields, nil)
 	local getters = normalizeNameMap(context, "Delegate Getters", spec.Getters, nil)
 
-	local out = {}
+	local out: MemberTable = {}
 	local function put(name: string, fn: Method)
 		if out[name] ~= nil then
 			error(("%s: delegate would define '%s' twice"):format(context, name), 4)
@@ -1030,48 +1094,48 @@ local function makeDelegate(context: string, spec: any): MemberTable
 	end
 
 	local function reach(selfArg: any, memberName: string): any
-		local target = selfArg[to]
-		if target == nil then
+		local holder = selfArg[to]
+		if holder == nil then
 			if optional then
 				return nil
 			end
 			error(("'%s' cannot run — delegate target '%s' is nil"):format(memberName, to), 3)
 		end
-		return target
+		return holder
 	end
 
 	for exposed, remote in pairs(methods) do
-		put(exposed, function(selfArg, ...)
-			local target = reach(selfArg, exposed)
-			if target == nil then
+		put(exposed, function(selfArg: any, ...: any): ...any
+			local holder = reach(selfArg, exposed)
+			if holder == nil then
 				return nil
 			end
-			local fn = target[remote]
+			local fn = holder[remote]
 			if type(fn) ~= "function" then
 				error(("delegate '%s' expected a method '%s' on '%s'"):format(exposed, remote, to), 2)
 			end
-			return fn(target, ...)
+			return fn(holder, ...)
 		end)
 	end
 
 	local function putGetter(exposed: string, remote: string)
 		local getName = "Get" .. exposed
-		put(getName, function(selfArg)
-			local target = reach(selfArg, getName)
-			if target == nil then
+		put(getName, function(selfArg: any): any
+			local holder = reach(selfArg, getName)
+			if holder == nil then
 				return nil
 			end
-			return target[remote]
+			return holder[remote]
 		end)
 	end
 
 	for exposed, remote in pairs(fields) do
 		putGetter(exposed, remote)
 		local setName = "Set" .. exposed
-		put(setName, function(selfArg, value)
-			local target = reach(selfArg, setName)
-			if target ~= nil then
-				target[remote] = value
+		put(setName, function(selfArg: any, value: any)
+			local holder = reach(selfArg, setName)
+			if holder ~= nil then
+				holder[remote] = value
 			end
 		end)
 	end
@@ -1132,7 +1196,7 @@ local function absorbMembers(className: string, src: MemberTable, fieldsDst: Mem
 	end
 end
 
-local function absorbMeta(def: any, key: string, value: any, className: string)
+local function absorbMeta(def: ClassDef, key: string, value: any, className: string)
 	if RESERVED_META[key] then
 		error(("class '%s': metamethod '%s' is reserved by LehuaClass"):format(className, key), 3)
 	end
@@ -1170,14 +1234,15 @@ local function absorbMeta(def: any, key: string, value: any, className: string)
 	def.meta[key] = value
 end
 
-local function pickMembers(className: string, parentDef: any, names: { string }?, sources: { { from: MemberTable, into: MemberTable } }, label: string)
+local function pickMembers(className: string, parentDef: ClassDef, names: { string }?, sources: { { from: MemberTable, into: MemberTable } }, label: string)
 	if names == nil then
 		return
 	end
 	if type(names) ~= "table" then
 		error(("class '%s': Inherits entry %s must be a list of member names"):format(className, label), 3)
 	end
-	for _, name in ipairs(names) do
+	local wanted: { string } = names :: any
+	for _, name in ipairs(wanted) do
 		if type(name) ~= "string" then
 			error(("class '%s': Inherits entry %s must contain strings"):format(className, label), 3)
 		end
@@ -1218,7 +1283,7 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 		end
 	end
 
-	local def = {
+	local def: ClassDef = {
 		name = className,
 		strict = decl.Strict ~= false,
 		abstract = decl.Abstract == true,
@@ -1242,7 +1307,9 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 		ancestors = {},
 		ancestorNames = {},
 		boundCache = {},
-	}
+		privateKeySet = {},
+		publicFieldSet = {},
+	} :: any
 
 	local inherits = decl.Inherits
 	if inherits ~= nil then
@@ -1274,7 +1341,8 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 				table.insert(def.traits, trait)
 			end
 		elseif type(inherits) == "table" then
-			for i, entry in ipairs(inherits) do
+			local picks: { any } = inherits :: any
+			for i, entry in ipairs(picks) do
 				if type(entry) ~= "table" then
 					error(("class '%s': Inherits[%d] must be { Class = ..., Public = {...} }"):format(className, i), 2)
 				end
@@ -1305,7 +1373,8 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 					{ from = parentDef.meta, into = def.meta },
 				}, "Meta")
 				if entry.Static ~= nil then
-					for _, name in ipairs(entry.Static) do
+					local statics: { string } = entry.Static :: any
+					for _, name in ipairs(statics) do
 						local v = staticLookup(parentDef, name)
 						if v == nil then
 							error(
@@ -1333,7 +1402,7 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 		end
 	end
 
-	local declaredKeys = {}
+	local declaredKeys: { [string]: boolean } = {}
 	local function noteDeclared(source: any)
 		if type(source) == "table" then
 			for k in pairs(source) do
@@ -1359,7 +1428,7 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 		if type(decl.Delegates) ~= "table" then
 			error(("class '%s': Delegates must be a list of delegate specs"):format(className), 2)
 		end
-		local delegated = {}
+		local delegated: { [string]: boolean } = {}
 		for i, spec in ipairs(decl.Delegates) do
 			local generated = makeDelegate(("class '%s': Delegates[%d]"):format(className, i), spec)
 			for name, fn in pairs(generated) do
@@ -1448,7 +1517,7 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 		if type(decl.Interfaces) ~= "table" then
 			error(("class '%s': Interfaces must be a list"):format(className), 2)
 		end
-		local seen = {}
+		local seen: { [any]: boolean } = {}
 		for _, iface in ipairs(def.interfaces) do
 			seen[iface] = true
 		end
@@ -1476,7 +1545,7 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 	end
 
 	local handle = setmetatable({}, {
-		__index = function(_, key)
+		__index = function(_: any, key: string): any
 			if key == "Name" then
 				return def.name
 			end
@@ -1494,7 +1563,7 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 			end
 			return nil
 		end,
-		__newindex = function(_, key, value)
+		__newindex = function(_: any, key: string, value: any)
 			if key == "Name" then
 				error(("class '%s': Name is read-only"):format(def.name), 2)
 			end
@@ -1503,24 +1572,25 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 			end
 			def.ownStatics[key] = value
 		end,
-		__call = function(h, ...)
+		__call = function(h: any, ...: any): ...any
 			return LehuaClass.BuildClassData(h, ...)
 		end,
-		__tostring = function()
+		__tostring = function(): string
 			return "Class<" .. def.name .. ">"
 		end,
 		__metatable = "The metatable is locked",
 	})
 
-	def.handle = handle
-	def.ancestors[handle] = true
+	local classHandle: Class = handle :: any
+	def.handle = classHandle
+	def.ancestors[classHandle] = true
 	def.ancestorNames[className] = true
 	def.innerMeta = buildInnerMeta(def)
 	def.outerMeta = buildOuterMeta(def)
 
-	handleToDef[handle] = def
-	classesByName[className] = handle
-	return handle
+	handleToDef[classHandle] = def
+	classesByName[className] = classHandle
+	return classHandle
 end
 
 function LehuaClass.BuildClassData(classHandle: Class, ...: any): Object
@@ -1561,7 +1631,7 @@ function LehuaClass.BuildClassData(classHandle: Class, ...: any): Object
 	for _, readyFn in ipairs(def.readies) do
 		readyFn(fields, ...)
 	end
-	return proxy
+	return (proxy :: any) :: Object
 end
 
 function LehuaClass.SuperGet(classHandle: Class, memberName: string): (self: any, ...any) -> ...any
@@ -1569,7 +1639,7 @@ function LehuaClass.SuperGet(classHandle: Class, memberName: string): (self: any
 	if def == nil then
 		error("SuperGet expects a class as its first argument", 2)
 	end
-	local fn
+	local fn: Method?
 	if memberName == "__construct" then
 		fn = def.construct
 		if fn == nil then
@@ -1597,16 +1667,14 @@ function LehuaClass.SuperGet(classHandle: Class, memberName: string): (self: any
 			2
 		)
 	end
-	return function(selfArg, ...)
-		return rewrapResults(fn(unwrapOne(selfArg), ...))
+	local impl: Method = fn :: Method
+	return function(selfArg: any, ...: any): ...any
+		return rewrapResults(impl(unwrapOne(selfArg), ...))
 	end
 end
 
 function LehuaClass.IsA(value: any, classOrName: Class | string): boolean
-	local def = resolveInstance(value)
-	if def == nil then
-		def = handleToDef[value]
-	end
+	local def = resolveInstance(value) or handleToDef[value]
 	if def == nil then
 		return false
 	end
@@ -1634,10 +1702,7 @@ function LehuaClass.FetchClass(value: any): Class?
 end
 
 function LehuaClass.GetMetaData(value: any): Metadata
-	local def = resolveInstance(value)
-	if def == nil then
-		def = handleToDef[value]
-	end
+	local def = resolveInstance(value) or handleToDef[value]
 	if def == nil and type(value) == "string" then
 		local named = classesByName[value]
 		if named ~= nil then
@@ -1663,11 +1728,11 @@ function LehuaClass.Ref(value: any): Object?
 		return nil
 	end
 	if outerToRecord[value] ~= nil then
-		return value
+		return value :: Object
 	end
 	local outer = innerToOuter[value]
 	if outer ~= nil then
-		return outer
+		return outer :: Object
 	end
 	return nil
 end
@@ -1675,11 +1740,11 @@ end
 function LehuaClass.GetTopLevel(value: any): Object
 	if type(value) == "table" then
 		if outerToRecord[value] ~= nil then
-			return value
+			return value :: Object
 		end
 		local outer = innerToOuter[value]
 		if outer ~= nil then
-			return outer
+			return outer :: Object
 		end
 		if innerToDef[value] ~= nil then
 			error("GetTopLevel: this instance's public handle is no longer alive", 2)
@@ -1692,10 +1757,7 @@ LehuaClass.IsInterface = isInterface
 LehuaClass.IsTrait = isTrait
 
 function LehuaClass.HasTrait(value: any, traitOrName: Trait | string): boolean
-	local def = resolveInstance(value)
-	if def == nil then
-		def = handleToDef[value]
-	end
+	local def = resolveInstance(value) or handleToDef[value]
 	if def == nil then
 		return false
 	end
@@ -1719,10 +1781,7 @@ function LehuaClass.HasTrait(value: any, traitOrName: Trait | string): boolean
 end
 
 function LehuaClass.TraitsOf(value: any): { Trait }
-	local def = resolveInstance(value)
-	if def == nil then
-		def = handleToDef[value]
-	end
+	local def = resolveInstance(value) or handleToDef[value]
 	if def == nil then
 		return {}
 	end
@@ -1732,9 +1791,9 @@ end
 function LehuaClass.TypeOf(value: any): string
 	local def, fields = resolveInstance(value)
 	if def ~= nil then
-		local t = def.meta.__type
+		local t: any = def.meta["__type"]
 		if type(t) == "function" then
-			return tostring(t(fields))
+			return tostring((t :: Method)(fields))
 		elseif t ~= nil then
 			return tostring(t)
 		end
@@ -1753,17 +1812,19 @@ function LehuaClass.TypeOf(value: any): string
 end
 
 function LehuaClass.Inspect(value: any): string
-	local def, fields, rec = resolveInstance(value)
-	if def == nil then
+	local resolved, resolvedFields, rec = resolveInstance(value)
+	if resolved == nil then
 		return tostring(value)
 	end
-	local custom = def.meta.__toconsole
+	local def = resolved :: ClassDef
+	local fields: MemberTable = resolvedFields :: any
+	local custom: Method? = def.meta["__toconsole"]
 	if custom ~= nil then
 		return tostring(custom(fields))
 	end
 
-	local lines = { rec ~= nil and (def.name .. "#" .. rec.id) or def.name }
-	local publicKeys = {}
+	local lines: { string } = { rec ~= nil and (def.name .. "#" .. tostring(rec.id)) or def.name }
+	local publicKeys: { string } = {}
 	for k in pairs(def.publicFieldSet) do
 		table.insert(publicKeys, k)
 	end
@@ -1783,14 +1844,14 @@ function LehuaClass.Inspect(value: any): string
 		table.insert(lines, ("  %s = %s (static)"):format(k, tostring(def.ownStatics[k])))
 	end
 	if #def.traits > 0 then
-		local names = {}
+		local names: { string } = {}
 		for _, trait in ipairs(def.traits) do
 			table.insert(names, trait.Name)
 		end
 		table.insert(lines, "  uses: " .. table.concat(names, ", "))
 	end
 	if #def.interfaces > 0 then
-		local names = {}
+		local names: { string } = {}
 		for _, iface in ipairs(def.interfaces) do
 			table.insert(names, iface.Name)
 		end
@@ -1806,12 +1867,13 @@ local LEHUA_GLOBALS = {
 }
 
 function LehuaClass.Globalize(target: MemberTable?): LehuaClassModule
-	target = target or _G
-	if type(target) ~= "table" then
+	local into: MemberTable = target or (_G :: any)
+	if type(into) ~= "table" then
 		error("Globalize expects a table (or a reachable _G)", 2)
 	end
+	local api = LehuaClass :: MemberTable
 	for _, name in ipairs(LEHUA_GLOBALS) do
-		target[name] = LehuaClass[name]
+		into[name] = api[name]
 	end
 	return (LehuaClass :: any) :: LehuaClassModule
 end
