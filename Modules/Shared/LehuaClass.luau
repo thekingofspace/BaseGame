@@ -24,6 +24,17 @@ export type InterfaceSpec = {
 
 export type Metadata = { [any]: any }
 
+export type Control = {
+	__lehua: string,
+	Get: Method?,
+	Set: Method?,
+}
+
+export type ControlSpec = {
+	Get: Method?,
+	Set: Method?,
+}
+
 export type InheritPick = {
 	Class: Class,
 	Public: { string }?,
@@ -121,6 +132,9 @@ export type LehuaClassModule = {
 	IsTrait: (value: any) -> boolean,
 	HasTrait: (value: any, traitOrName: Trait | string) -> boolean,
 	TraitsOf: (value: any) -> { Trait },
+	ControlSpecifier: (spec: ControlSpec) -> Control,
+	IsControl: (value: any) -> boolean,
+	ControlsOf: (value: any) -> { [string]: string },
 	Fuse: (...MemberTable) -> MemberTable,
 	SourceOf: (value: any, memberName: string) -> string?,
 	MergedKeys: (value: any) -> { [string]: string },
@@ -165,11 +179,19 @@ type ClassDef = {
 	boundCache: MemberTable,
 	privateKeySet: MemberTable,
 	publicFieldSet: MemberTable,
+	controls: { [string]: ControlEntry },
 	mergedKeys: { [string]: string },
 	memberSource: { [string]: string },
 	handle: Class,
 	innerMeta: any,
 	outerMeta: any,
+}
+
+type ControlEntry = {
+	Get: Method?,
+	Set: Method?,
+	Visibility: string,
+	Owner: string,
 }
 
 type InstanceRecord = {
@@ -198,6 +220,7 @@ local LehuaClass = {}
 
 local INTERFACE_TAG = "LehuaClass.Interface"
 local TRAIT_TAG = "LehuaClass.Trait"
+local CONTROL_TAG = "LehuaClass.Control"
 
 local None = table.freeze(setmetatable({}, table.freeze({
 	__tostring = function()
@@ -238,7 +261,7 @@ local function deepCopy(value: any, seen: { [any]: any }): any
 		return value
 	end
 	local tag = rawget(value, "__lehua")
-	if tag == INTERFACE_TAG or tag == TRAIT_TAG then
+	if tag == INTERFACE_TAG or tag == TRAIT_TAG or tag == CONTROL_TAG then
 		return value
 	end
 	local hit = seen[value]
@@ -373,6 +396,63 @@ local function staticLookup(def: ClassDef, key: string): any
 	return nil
 end
 
+local function isControl(v: any): boolean
+	return type(v) == "table" and rawget(v, "__lehua") == CONTROL_TAG
+end
+
+function LehuaClass.ControlSpecifier(spec: ControlSpec): Control
+	if type(spec) ~= "table" then
+		error("ControlSpecifier expects a table { Get = ..., Set = ... }", 2)
+	end
+	for k in pairs(spec :: any) do
+		if k ~= "Get" and k ~= "Set" then
+			error(("ControlSpecifier: unknown key '%s' (expected Get or Set)"):format(tostring(k)), 2)
+		end
+	end
+	if spec.Get == nil and spec.Set == nil then
+		error("ControlSpecifier needs at least a Get or a Set", 2)
+	end
+	if spec.Get ~= nil and type(spec.Get) ~= "function" then
+		error("ControlSpecifier: Get must be a function", 2)
+	end
+	if spec.Set ~= nil and type(spec.Set) ~= "function" then
+		error("ControlSpecifier: Set must be a function", 2)
+	end
+
+	return table.freeze({
+		__lehua = CONTROL_TAG,
+		Get = spec.Get,
+		Set = spec.Set,
+	}) :: any
+end
+
+LehuaClass.IsControl = isControl
+
+local function readStatic(def: ClassDef, key: string): any
+	local v = staticLookup(def, key)
+	if isControl(v) then
+		local control = v :: Control
+		if control.Get == nil then
+			error(("'%s.%s' is write-only"):format(def.name, key), 3)
+		end
+		return (control.Get :: any)()
+	end
+	return v
+end
+
+local function writeStatic(def: ClassDef, key: string, value: any): boolean
+	local v = staticLookup(def, key)
+	if not isControl(v) then
+		return false
+	end
+	local control = v :: Control
+	if control.Set == nil then
+		error(("'%s.%s' is read-only"):format(def.name, key), 3)
+	end
+	(control.Set :: any)(value)
+	return true
+end
+
 local function makeBound(def: ClassDef, name: string): Method
 	return function(selfArg: any, ...): ...any
 		local found = type(selfArg) == "table" and outerToRecord[selfArg] or nil
@@ -432,6 +512,21 @@ local function buildOuterMeta(def: ClassDef): MemberTable
 		if def.pubMethods[key] ~= nil then
 			return getBound(def, key)
 		end
+		local control = def.controls[key]
+		if control ~= nil then
+			if control.Visibility == "private" then
+				error(
+					("'%s.%s' is private — only %s methods can reach it through self"):format(
+						def.name, tostring(key), def.name
+					),
+					2
+				)
+			end
+			if control.Get == nil then
+				error(("'%s.%s' is write-only"):format(def.name, tostring(key)), 2)
+			end
+			return rewrapResults((control.Get :: Method)(rec.fields))
+		end
 		if def.privateKeySet[key] then
 			error(
 				("'%s.%s' is private — only %s methods can reach it through self"):format(
@@ -443,9 +538,8 @@ local function buildOuterMeta(def: ClassDef): MemberTable
 		if def.publicFieldSet[key] or rec.extraPublic[key] then
 			return rec.fields[key]
 		end
-		local sv = staticLookup(def, key)
-		if sv ~= nil then
-			return sv
+		if staticLookup(def, key) ~= nil then
+			return readStatic(def, key)
 		end
 		if def.strict then
 			error(
@@ -460,6 +554,17 @@ local function buildOuterMeta(def: ClassDef): MemberTable
 
 	meta.__newindex = function(proxy: any, key: string, value: any)
 		local rec = outerToRecord[proxy] :: InstanceRecord
+		local control = def.controls[key]
+		if control ~= nil then
+			if control.Visibility == "private" then
+				error(("cannot write private member '%s.%s' from outside"):format(def.name, tostring(key)), 2)
+			end
+			if control.Set == nil then
+				error(("'%s.%s' is read-only"):format(def.name, tostring(key)), 2)
+			end
+			(control.Set :: Method)(rec.fields, value)
+			return
+		end
 		if def.privateKeySet[key] then
 			error(("cannot write private member '%s.%s' from outside"):format(def.name, tostring(key)), 2)
 		end
@@ -510,12 +615,37 @@ end
 
 local function buildInnerMeta(def: ClassDef): MemberTable
 	return {
-		__index = function(_: any, key: string): any
+		__index = function(fields: any, key: string): any
 			local m = def.pubMethods[key] or def.privMethods[key]
 			if m ~= nil then
 				return m
 			end
-			return staticLookup(def, key)
+			local control = def.controls[key]
+			if control ~= nil then
+				if control.Get == nil then
+					error(("'%s.%s' is write-only"):format(def.name, tostring(key)), 2)
+				end
+				return (control.Get :: Method)(fields)
+			end
+			if staticLookup(def, key) ~= nil then
+				return readStatic(def, key)
+			end
+			return nil
+		end,
+
+		__newindex = function(fields: any, key: string, value: any)
+			local control = def.controls[key]
+			if control ~= nil then
+				if control.Set == nil then
+					error(("'%s.%s' is read-only"):format(def.name, tostring(key)), 2)
+				end
+				(control.Set :: Method)(fields, value)
+				return
+			end
+			if staticLookup(def, key) ~= nil and writeStatic(def, key, value) then
+				return
+			end
+			rawset(fields, key, value)
 		end,
 		__tostring = function(fields: any): string
 			local outer = innerToOuter[fields]
@@ -601,6 +731,10 @@ local function classProbe(def: ClassDef): Probe
 		if def.pubMethods[name] ~= nil then
 			return true, "function"
 		end
+		local control = def.controls[name]
+		if control ~= nil then
+			return control.Visibility == "public", "any"
+		end
 		local fv = def.pubFields[name]
 		if fv ~= nil then
 			return true, fv == None and "nil" or type(fv)
@@ -621,6 +755,13 @@ local function instanceProbe(def: ClassDef, fields: any, rec: InstanceRecord?): 
 	return function(name)
 		if def.pubMethods[name] ~= nil then
 			return true, "function"
+		end
+		local control = def.controls[name]
+		if control ~= nil then
+			if control.Visibility ~= "public" or control.Get == nil then
+				return control.Visibility == "public", "any"
+			end
+			return true, type((control.Get :: Method)(fields))
 		end
 		if def.publicFieldSet[name] or (rec ~= nil and rec.extraPublic[name]) then
 			return true, type(fields[name])
@@ -643,7 +784,7 @@ local function checkMembers(probe: Probe, requires: { [string]: string }): (bool
 		local present, valueType = probe(member)
 		if not present then
 			table.insert(missing, ("%s (missing)"):format(member))
-		elseif expected ~= "any" and valueType ~= expected then
+		elseif expected ~= "any" and valueType ~= "any" and valueType ~= expected then
 			table.insert(missing, ("%s (expected %s, got %s)"):format(member, expected, valueType))
 		end
 	end
@@ -1050,6 +1191,39 @@ local function noteSource(def: ClassDef, name: string, contributor: string)
 	end
 end
 
+local function takeControl(def: ClassDef, className: string, name: string, value: any, visibility: string, owner: string, level: number): boolean
+	if not isControl(value) then
+		return false
+	end
+
+	local existing = def.controls[name]
+	if existing ~= nil and existing.Visibility ~= visibility then
+		error(
+			("class '%s': control '%s' is %s in '%s' and %s in '%s'"):format(
+				className, name, existing.Visibility, existing.Owner, visibility, owner
+			),
+			level
+		)
+	end
+	if def.mergedKeys[name] ~= nil then
+		error(("class '%s': '%s' is a merged member and cannot also be a control"):format(className, name), level)
+	end
+
+	local control = value :: Control
+	def.controls[name] = {
+		Get = control.Get,
+		Set = control.Set,
+		Visibility = visibility,
+		Owner = owner,
+	}
+	def.pubFields[name] = nil
+	def.privFields[name] = nil
+	def.pubMethods[name] = nil
+	def.privMethods[name] = nil
+	noteSource(def, name, owner)
+	return true
+end
+
 local function routeMergedMembers(className: string, traitName: string, src: MemberTable, filter: TraitFilter, def: ClassDef, visibility: string, owner: { [string]: string })
 	local only, except, rename = filter.only, filter.except, filter.rename
 	for key, value in pairs(src) do
@@ -1085,7 +1259,7 @@ local function routeMergedMembers(className: string, traitName: string, src: Mem
 	end
 end
 
-local function routeTraitMembers(className: string, traitName: string, src: MemberTable, filter: TraitFilter, owner: { [string]: string }, fieldsDst: MemberTable, methodsDst: MemberTable?, label: string, declared: { [string]: boolean }, def: ClassDef)
+local function routeTraitMembers(className: string, traitName: string, src: MemberTable, filter: TraitFilter, owner: { [string]: string }, fieldsDst: MemberTable, methodsDst: MemberTable?, label: string, declared: { [string]: boolean }, def: ClassDef, visibility: string?)
 	local only, except, rename = filter.only, filter.except, filter.rename
 	for key, value in pairs(src) do
 		if (only == nil or only[key]) and (except == nil or not except[key]) then
@@ -1097,6 +1271,20 @@ local function routeTraitMembers(className: string, traitName: string, src: Memb
 					),
 					4
 				)
+			end
+			if visibility ~= nil and isControl(value) then
+				local prior = owner[name]
+				if prior ~= nil and prior ~= traitName and not declared[name] then
+					error(
+						("class '%s': traits '%s' and '%s' both provide control '%s' — declare '%s' on the class, or filter one with Only/Except/Rename"):format(
+							className, prior, traitName, name, name
+						),
+						4
+					)
+				end
+				takeControl(def, className, name, value, visibility, traitName, 4)
+				owner[name] = traitName
+				continue
 			end
 			local previous = owner[name]
 			if previous ~= nil and previous ~= traitName and not declared[name] then
@@ -1169,9 +1357,9 @@ local function applyTraits(def: ClassDef, decl: ClassDecl, className: string, de
 				routeMergedMembers(className, member.Name, member.MergedPublic, filter, def, "public", memberOwner)
 				routeMergedMembers(className, member.Name, member.MergedPrivate, filter, def, "private", memberOwner)
 
-				routeTraitMembers(className, member.Name, member.Public, filter, memberOwner, def.pubFields, def.pubMethods, "member", declared, def)
-				routeTraitMembers(className, member.Name, member.Private, filter, memberOwner, def.privFields, def.privMethods, "member", declared, def)
-				routeTraitMembers(className, member.Name, member.Static, filter, staticOwner, def.ownStatics, nil, "static", declared, def)
+				routeTraitMembers(className, member.Name, member.Public, filter, memberOwner, def.pubFields, def.pubMethods, "member", declared, def, "public")
+				routeTraitMembers(className, member.Name, member.Private, filter, memberOwner, def.privFields, def.privMethods, "member", declared, def, "private")
+				routeTraitMembers(className, member.Name, member.Static, filter, staticOwner, def.ownStatics, nil, "static", declared, def, nil)
 
 				for key, fn in pairs(member.Meta) do
 					local previous = metaOwner[key]
@@ -1317,7 +1505,7 @@ local function assertMemberTable(className: string, t: any, label: string): Memb
 	return t or {}
 end
 
-local function absorbMembers(className: string, src: MemberTable, fieldsDst: MemberTable, methodsDst: MemberTable, label: string)
+local function absorbMembers(className: string, src: MemberTable, fieldsDst: MemberTable, methodsDst: MemberTable, label: string, def: ClassDef, visibility: string)
 	for k, v in pairs(src) do
 		if type(k) ~= "string" then
 			error(("class '%s': %s member names must be strings"):format(className, label), 3)
@@ -1330,6 +1518,10 @@ local function absorbMembers(className: string, src: MemberTable, fieldsDst: Mem
 				3
 			)
 		end
+		if takeControl(def, className, k, v, visibility, className, 3) then
+			continue
+		end
+		def.controls[k] = nil
 		if type(v) == "function" then
 			methodsDst[k] = v
 			fieldsDst[k] = nil
@@ -1399,6 +1591,9 @@ local function pickMembers(className: string, parentDef: ClassDef, names: { stri
 				break
 			end
 		end
+		if not found and parentDef.controls[name] ~= nil then
+			found = true
+		end
 		if not found then
 			error(
 				("class '%s': parent '%s' has no %s member named '%s'"):format(
@@ -1453,6 +1648,7 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 		boundCache = {},
 		privateKeySet = {},
 		publicFieldSet = {},
+		controls = {},
 		mergedKeys = {},
 		memberSource = {},
 	} :: any
@@ -1488,6 +1684,7 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 			end
 			for k, v in pairs(singleParent.mergedKeys) do def.mergedKeys[k] = v end
 			for k, v in pairs(singleParent.memberSource) do def.memberSource[k] = v end
+			for k, v in pairs(singleParent.controls) do def.controls[k] = v end
 		elseif type(inherits) == "table" then
 			local picks: { any } = inherits :: any
 			for i, entry in ipairs(picks) do
@@ -1532,6 +1729,10 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 						local origin = parentDef.memberSource[name]
 						if origin ~= nil then
 							def.memberSource[name] = origin
+						end
+						local control = parentDef.controls[name]
+						if control ~= nil then
+							def.controls[name] = control
 						end
 					end
 				end
@@ -1679,8 +1880,8 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 	assertNotMerged(decl.Public, "Public")
 	assertNotMerged(decl.Private, "Private")
 
-	absorbMembers(className, assertMemberTable(className, decl.Private, "Private"), def.privFields, def.privMethods, "Private")
-	absorbMembers(className, assertMemberTable(className, decl.Public, "Public"), def.pubFields, def.pubMethods, "Public")
+	absorbMembers(className, assertMemberTable(className, decl.Private, "Private"), def.privFields, def.privMethods, "Private", def, "private")
+	absorbMembers(className, assertMemberTable(className, decl.Public, "Public"), def.pubFields, def.pubMethods, "Public", def, "public")
 	for k in pairs(declaredKeys) do
 		if def.mergedKeys[k] == nil then
 			def.memberSource[k] = className
@@ -1782,9 +1983,8 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 			if key == "Name" then
 				return def.name
 			end
-			local sv = staticLookup(def, key)
-			if sv ~= nil then
-				return sv
+			if staticLookup(def, key) ~= nil then
+				return readStatic(def, key)
 			end
 			if def.strict then
 				error(
@@ -1799,6 +1999,9 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 		__newindex = function(_: any, key: string, value: any)
 			if key == "Name" then
 				error(("class '%s': Name is read-only"):format(def.name), 2)
+			end
+			if writeStatic(def, key, value) then
+				return
 			end
 			if value == nil then
 				error(("class '%s': statics cannot hold nil"):format(def.name), 2)
@@ -2033,6 +2236,22 @@ function LehuaClass.SourceOf(value: any, memberName: string): string?
 	return def.memberSource[memberName]
 end
 
+function LehuaClass.ControlsOf(value: any): { [string]: string }
+	local def = resolveInstance(value) or handleToDef[value]
+	if def == nil then
+		return {}
+	end
+	local out: { [string]: string } = {}
+	for name, control in pairs(def.controls) do
+		local mode = if control.Get ~= nil and control.Set ~= nil
+			then "get/set"
+			elseif control.Get ~= nil then "get"
+			else "set"
+		out[name] = ("%s %s"):format(control.Visibility, mode)
+	end
+	return out
+end
+
 function LehuaClass.MergedKeys(value: any): { [string]: string }
 	local def = resolveInstance(value) or handleToDef[value]
 	if def == nil then
@@ -2203,6 +2422,19 @@ function LehuaClass.Inspect(value: any): string
 	end
 	for _, k in ipairs(sortedKeys(def.pubMethods)) do
 		table.insert(lines, ("  %s = <method>"):format(k))
+	end
+	for _, k in ipairs(sortedKeys(def.controls)) do
+		local control = def.controls[k]
+		if control.Visibility == "public" then
+			local mode = if control.Get ~= nil and control.Set ~= nil
+				then "get/set"
+				elseif control.Get ~= nil then "get"
+				else "set"
+			local shown = if control.Get ~= nil
+				then tostring((control.Get :: Method)(fields))
+				else "(write-only)"
+			table.insert(lines, ("  %s = %s <%s>"):format(k, shown, mode))
+		end
 	end
 	for _, k in ipairs(sortedKeys(def.ownStatics)) do
 		table.insert(lines, ("  %s = %s (static)"):format(k, tostring(def.ownStatics[k])))
