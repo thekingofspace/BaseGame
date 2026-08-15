@@ -37,6 +37,8 @@ export type Trait = {
 	Name: string,
 	Public: MemberTable,
 	Private: MemberTable,
+	MergedPublic: MemberTable,
+	MergedPrivate: MemberTable,
 	Static: MemberTable,
 	Meta: MemberTable,
 	Metadata: Metadata,
@@ -50,11 +52,27 @@ export type TraitSpec = {
 	Name: string,
 	Public: MemberTable?,
 	Private: MemberTable?,
+	MergedPublic: MemberTable?,
+	MergedPrivate: MemberTable?,
 	Static: MemberTable?,
 	Meta: MemberTable?,
 	Requires: ({ string } | { [string]: string })?,
 	Uses: { Trait }?,
 	[string]: any,
+}
+
+export type TraitReport = {
+	Name: string,
+	Uses: { string },
+	Public: { string },
+	Private: { string },
+	MergedPublic: { string },
+	MergedPrivate: { string },
+	Static: { string },
+	Meta: { string },
+	Requires: { [string]: string },
+	Setups: number,
+	Readies: number,
 }
 
 export type TraitPick = {
@@ -76,6 +94,8 @@ export type ClassDecl = {
 	Name: string,
 	Private: MemberTable?,
 	Public: MemberTable?,
+	MergedPublic: MemberTable?,
+	MergedPrivate: MemberTable?,
 	Static: MemberTable?,
 	Meta: MemberTable?,
 	Inherits: (Class | { InheritPick })?,
@@ -101,6 +121,11 @@ export type LehuaClassModule = {
 	IsTrait: (value: any) -> boolean,
 	HasTrait: (value: any, traitOrName: Trait | string) -> boolean,
 	TraitsOf: (value: any) -> { Trait },
+	Fuse: (...MemberTable) -> MemberTable,
+	SourceOf: (value: any, memberName: string) -> string?,
+	MergedKeys: (value: any) -> { [string]: string },
+	TraitConflicts: (...Trait) -> { [string]: { string } },
+	TraitInfo: (trait: Trait) -> TraitReport,
 	IsA: (value: any, classOrName: Class | string) -> boolean,
 	FetchClass: (value: any) -> Class?,
 	GetMetaData: (value: any) -> Metadata,
@@ -140,6 +165,8 @@ type ClassDef = {
 	boundCache: MemberTable,
 	privateKeySet: MemberTable,
 	publicFieldSet: MemberTable,
+	mergedKeys: { [string]: string },
+	memberSource: { [string]: string },
 	handle: Class,
 	innerMeta: any,
 	outerMeta: any,
@@ -690,6 +717,8 @@ local KNOWN_TRAIT_KEYS = {
 	Name = true,
 	Public = true,
 	Private = true,
+	MergedPublic = true,
+	MergedPrivate = true,
 	Static = true,
 	Meta = true,
 	Requires = true,
@@ -712,6 +741,39 @@ local function copyTraitMembers(traitName: string, src: any, label: string): Mem
 			error(
 				("trait '%s': metamethod '%s' belongs at the top level of the trait, not inside %s"):format(
 					traitName, k, label
+				),
+				3
+			)
+		end
+		out[k] = v
+	end
+	return out
+end
+
+local function copyMergedMembers(traitName: string, src: any, label: string): MemberTable
+	if src == nil then
+		return {}
+	end
+	if type(src) ~= "table" then
+		error(("trait '%s': %s must be a table"):format(traitName, label), 3)
+	end
+	local out: MemberTable = {}
+	for k, v in pairs(src) do
+		if type(k) ~= "string" then
+			error(("trait '%s': %s member names must be strings"):format(traitName, label), 3)
+		end
+		if k:sub(1, 2) == "__" then
+			error(
+				("trait '%s': metamethod '%s' belongs at the top level of the trait, not inside %s"):format(
+					traitName, k, label
+				),
+				3
+			)
+		end
+		if type(v) ~= "table" then
+			error(
+				("trait '%s': %s member '%s' must be a table — merged members fuse their contents"):format(
+					traitName, label, k
 				),
 				3
 			)
@@ -790,12 +852,24 @@ function LehuaClass.Trait(spec: TraitSpec): Trait
 	local public = copyTraitMembers(traitName, spec.Public, "Public")
 	local private = copyTraitMembers(traitName, spec.Private, "Private")
 	local static = copyTraitMembers(traitName, spec.Static, "Static")
+	local mergedPublic = copyMergedMembers(traitName, spec.MergedPublic, "MergedPublic")
+	local mergedPrivate = copyMergedMembers(traitName, spec.MergedPrivate, "MergedPrivate")
 
-	for k in pairs(private) do
-		if public[k] ~= nil then
-			error(("trait '%s': member '%s' is declared both private and public"):format(traitName, k), 2)
+	local claimed: { [string]: string } = {}
+	local function claim(name: string, where: string)
+		local prior = claimed[name]
+		if prior ~= nil then
+			error(
+				("trait '%s': member '%s' is declared in both %s and %s"):format(traitName, name, prior, where),
+				3
+			)
 		end
+		claimed[name] = where
 	end
+	for k in pairs(public) do claim(k, "Public") end
+	for k in pairs(private) do claim(k, "Private") end
+	for k in pairs(mergedPublic) do claim(k, "MergedPublic") end
+	for k in pairs(mergedPrivate) do claim(k, "MergedPrivate") end
 
 	if spec.Meta ~= nil then
 		if type(spec.Meta) ~= "table" then
@@ -819,6 +893,8 @@ function LehuaClass.Trait(spec: TraitSpec): Trait
 		Name = traitName,
 		Public = table.freeze(public),
 		Private = table.freeze(private),
+		MergedPublic = table.freeze(mergedPublic),
+		MergedPrivate = table.freeze(mergedPrivate),
 		Static = table.freeze(static),
 		Meta = table.freeze(draft.Meta),
 		Metadata = table.freeze(draft.Metadata),
@@ -956,11 +1032,72 @@ local function checkFilterNames(className: string, index: number, traitName: str
 	end
 end
 
-local function routeTraitMembers(className: string, traitName: string, src: MemberTable, filter: TraitFilter, owner: { [string]: string }, fieldsDst: MemberTable, methodsDst: MemberTable?, label: string, declared: { [string]: boolean })
+local function fuseTables(into: MemberTable, from: MemberTable): MemberTable
+	local fused: MemberTable = {}
+	if into ~= nil then
+		mergeMetadata(fused, into)
+	end
+	mergeMetadata(fused, from)
+	return fused
+end
+
+local function noteSource(def: ClassDef, name: string, contributor: string)
+	local prior = def.memberSource[name]
+	if prior == nil then
+		def.memberSource[name] = contributor
+	elseif prior ~= contributor and not string.find(prior, contributor, 1, true) then
+		def.memberSource[name] = prior .. "+" .. contributor
+	end
+end
+
+local function routeMergedMembers(className: string, traitName: string, src: MemberTable, filter: TraitFilter, def: ClassDef, visibility: string, owner: { [string]: string })
 	local only, except, rename = filter.only, filter.except, filter.rename
 	for key, value in pairs(src) do
 		if (only == nil or only[key]) and (except == nil or not except[key]) then
 			local name = (rename ~= nil and rename[key]) or key
+			local prior = def.mergedKeys[name]
+
+			if prior ~= nil and prior ~= visibility then
+				error(
+					("class '%s': merged member '%s' is public in one trait and private in another"):format(
+						className, name
+					),
+					4
+				)
+			end
+			if prior == nil and owner[name] ~= nil then
+				error(
+					("class '%s': '%s' is a plain member from trait '%s' and a merged member from trait '%s' — they cannot fuse"):format(
+						className, name, owner[name], traitName
+					),
+					4
+				)
+			end
+
+			local fieldsDst = if visibility == "public" then def.pubFields else def.privFields
+			local methodsDst = if visibility == "public" then def.pubMethods else def.privMethods
+
+			fieldsDst[name] = fuseTables(fieldsDst[name], value)
+			methodsDst[name] = nil
+			def.mergedKeys[name] = visibility
+			noteSource(def, name, traitName)
+		end
+	end
+end
+
+local function routeTraitMembers(className: string, traitName: string, src: MemberTable, filter: TraitFilter, owner: { [string]: string }, fieldsDst: MemberTable, methodsDst: MemberTable?, label: string, declared: { [string]: boolean }, def: ClassDef)
+	local only, except, rename = filter.only, filter.except, filter.rename
+	for key, value in pairs(src) do
+		if (only == nil or only[key]) and (except == nil or not except[key]) then
+			local name = (rename ~= nil and rename[key]) or key
+			if def.mergedKeys[name] ~= nil then
+				error(
+					("class '%s': trait '%s' declares '%s' as a plain member, but another trait merges it"):format(
+						className, traitName, name
+					),
+					4
+				)
+			end
 			local previous = owner[name]
 			if previous ~= nil and previous ~= traitName and not declared[name] then
 				error(
@@ -1013,6 +1150,8 @@ local function applyTraits(def: ClassDef, decl: ClassDecl, className: string, de
 			for _, member in ipairs(group) do
 				for k in pairs(member.Public) do available[k] = true end
 				for k in pairs(member.Private) do available[k] = true end
+				for k in pairs(member.MergedPublic) do available[k] = true end
+				for k in pairs(member.MergedPrivate) do available[k] = true end
 				for k in pairs(member.Static) do available[k] = true end
 			end
 			checkFilterNames(className, index, trait.Name, available, only, "Only")
@@ -1027,9 +1166,12 @@ local function applyTraits(def: ClassDef, decl: ClassDecl, className: string, de
 				applied[member] = true
 				table.insert(def.traits, member)
 
-				routeTraitMembers(className, member.Name, member.Public, filter, memberOwner, def.pubFields, def.pubMethods, "member", declared)
-				routeTraitMembers(className, member.Name, member.Private, filter, memberOwner, def.privFields, def.privMethods, "member", declared)
-				routeTraitMembers(className, member.Name, member.Static, filter, staticOwner, def.ownStatics, nil, "static", declared)
+				routeMergedMembers(className, member.Name, member.MergedPublic, filter, def, "public", memberOwner)
+				routeMergedMembers(className, member.Name, member.MergedPrivate, filter, def, "private", memberOwner)
+
+				routeTraitMembers(className, member.Name, member.Public, filter, memberOwner, def.pubFields, def.pubMethods, "member", declared, def)
+				routeTraitMembers(className, member.Name, member.Private, filter, memberOwner, def.privFields, def.privMethods, "member", declared, def)
+				routeTraitMembers(className, member.Name, member.Static, filter, staticOwner, def.ownStatics, nil, "static", declared, def)
 
 				for key, fn in pairs(member.Meta) do
 					local previous = metaOwner[key]
@@ -1155,6 +1297,8 @@ local KNOWN_DECL_KEYS = {
 	Name = true,
 	Private = true,
 	Public = true,
+	MergedPublic = true,
+	MergedPrivate = true,
 	Static = true,
 	Meta = true,
 	Inherits = true,
@@ -1309,6 +1453,8 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 		boundCache = {},
 		privateKeySet = {},
 		publicFieldSet = {},
+		mergedKeys = {},
+		memberSource = {},
 	} :: any
 
 	local inherits = decl.Inherits
@@ -1340,6 +1486,8 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 			for _, trait in ipairs(singleParent.traits) do
 				table.insert(def.traits, trait)
 			end
+			for k, v in pairs(singleParent.mergedKeys) do def.mergedKeys[k] = v end
+			for k, v in pairs(singleParent.memberSource) do def.memberSource[k] = v end
 		elseif type(inherits) == "table" then
 			local picks: { any } = inherits :: any
 			for i, entry in ipairs(picks) do
@@ -1372,6 +1520,23 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 				pickMembers(className, parentDef, entry.Meta, {
 					{ from = parentDef.meta, into = def.meta },
 				}, "Meta")
+				local function carryMerged(names: any)
+					if names == nil then
+						return
+					end
+					for _, name in ipairs(names :: { string }) do
+						local visibility = parentDef.mergedKeys[name]
+						if visibility ~= nil then
+							def.mergedKeys[name] = visibility
+						end
+						local origin = parentDef.memberSource[name]
+						if origin ~= nil then
+							def.memberSource[name] = origin
+						end
+					end
+				end
+				carryMerged(entry.Public)
+				carryMerged(entry.Private)
 				if entry.Static ~= nil then
 					local statics: { string } = entry.Static :: any
 					for _, name in ipairs(statics) do
@@ -1414,6 +1579,8 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 	end
 	noteDeclared(decl.Private)
 	noteDeclared(decl.Public)
+	noteDeclared(decl.MergedPublic)
+	noteDeclared(decl.MergedPrivate)
 	noteDeclared(decl.Static)
 	noteDeclared(decl.Meta)
 	for k in pairs(decl) do
@@ -1452,8 +1619,74 @@ function LehuaClass.NewClassData(decl: ClassDecl): Class
 		end
 	end
 
+	local function absorbMerged(source: any, visibility: string, label: string)
+		if source == nil then
+			return
+		end
+		if type(source) ~= "table" then
+			error(("class '%s': %s must be a table"):format(className, label), 2)
+		end
+		local fieldsDst = if visibility == "public" then def.pubFields else def.privFields
+		local methodsDst = if visibility == "public" then def.pubMethods else def.privMethods
+		for name, value in pairs(source) do
+			if type(name) ~= "string" then
+				error(("class '%s': %s member names must be strings"):format(className, label), 2)
+			end
+			if type(value) ~= "table" then
+				error(
+					("class '%s': %s member '%s' must be a table — merged members fuse their contents"):format(
+						className, label, name
+					),
+					2
+				)
+			end
+			local prior = def.mergedKeys[name]
+			if prior ~= nil and prior ~= visibility then
+				error(
+					("class '%s': merged member '%s' is already %s — it cannot also be %s"):format(
+						className, name, prior, visibility
+					),
+					2
+				)
+			end
+			fieldsDst[name] = fuseTables(fieldsDst[name], value :: MemberTable)
+			methodsDst[name] = nil
+			def.mergedKeys[name] = visibility
+			noteSource(def, name, className)
+		end
+	end
+	absorbMerged(decl.MergedPublic, "public", "MergedPublic")
+	absorbMerged(decl.MergedPrivate, "private", "MergedPrivate")
+
+	local function assertNotMerged(source: any, label: string)
+		if type(source) ~= "table" then
+			return
+		end
+		for k in pairs(source) do
+			if type(k) == "string" and def.mergedKeys[k] ~= nil then
+				error(
+					("class '%s': '%s' is a merged member — declare it under %s, not %s"):format(
+						className,
+						k,
+						if def.mergedKeys[k] == "public" then "MergedPublic" else "MergedPrivate",
+						label
+					),
+					2
+				)
+			end
+		end
+	end
+	assertNotMerged(decl.Public, "Public")
+	assertNotMerged(decl.Private, "Private")
+
 	absorbMembers(className, assertMemberTable(className, decl.Private, "Private"), def.privFields, def.privMethods, "Private")
 	absorbMembers(className, assertMemberTable(className, decl.Public, "Public"), def.pubFields, def.pubMethods, "Public")
+	for k in pairs(declaredKeys) do
+		if def.mergedKeys[k] == nil then
+			def.memberSource[k] = className
+		end
+	end
+
 	for k, v in pairs(assertMemberTable(className, decl.Static, "Static")) do
 		if type(k) ~= "string" then
 			error(("class '%s': Static member names must be strings"):format(className), 2)
@@ -1778,6 +2011,137 @@ function LehuaClass.HasTrait(value: any, traitOrName: Trait | string): boolean
 		end
 	end
 	return false
+end
+
+function LehuaClass.Fuse(...: MemberTable): MemberTable
+	local out: MemberTable = {}
+	for i = 1, select("#", ...) do
+		local piece = select(i, ...)
+		if type(piece) ~= "table" then
+			error(("Fuse: argument %d is not a table"):format(i), 2)
+		end
+		mergeMetadata(out, piece :: MemberTable)
+	end
+	return out
+end
+
+function LehuaClass.SourceOf(value: any, memberName: string): string?
+	local def = resolveInstance(value) or handleToDef[value]
+	if def == nil then
+		return nil
+	end
+	return def.memberSource[memberName]
+end
+
+function LehuaClass.MergedKeys(value: any): { [string]: string }
+	local def = resolveInstance(value) or handleToDef[value]
+	if def == nil then
+		return {}
+	end
+	return table.clone(def.mergedKeys)
+end
+
+function LehuaClass.TraitConflicts(...: Trait): { [string]: { string } }
+	local flat: { Trait } = {}
+	local seen: { [any]: boolean } = {}
+	for i = 1, select("#", ...) do
+		local trait = select(i, ...)
+		if not isTrait(trait) then
+			error(("TraitConflicts: argument %d is not a Trait"):format(i), 2)
+		end
+		flattenTrait(trait :: Trait, flat, seen)
+	end
+
+	local plain: { [string]: { string } } = {}
+	local merged: { [string]: { string } } = {}
+
+	local function note(bucket: { [string]: { string } }, name: string, traitName: string)
+		local list = bucket[name]
+		if list == nil then
+			bucket[name] = { traitName }
+			return
+		end
+		for _, existing in ipairs(list) do
+			if existing == traitName then
+				return
+			end
+		end
+		table.insert(list, traitName)
+	end
+
+	for _, trait in ipairs(flat) do
+		for name in pairs(trait.Public) do note(plain, name, trait.Name) end
+		for name in pairs(trait.Private) do note(plain, name, trait.Name) end
+		for name in pairs(trait.Static) do note(plain, name, trait.Name) end
+		for name in pairs(trait.Meta) do note(plain, name, trait.Name) end
+		for name in pairs(trait.MergedPublic) do note(merged, name, trait.Name) end
+		for name in pairs(trait.MergedPrivate) do note(merged, name, trait.Name) end
+	end
+
+	local out: { [string]: { string } } = {}
+	for name, list in pairs(plain) do
+		local mergedList = merged[name]
+		if #list > 1 or mergedList ~= nil then
+			local all = table.clone(list)
+			if mergedList ~= nil then
+				for _, traitName in ipairs(mergedList) do
+					table.insert(all, traitName)
+				end
+			end
+			table.sort(all)
+			out[name] = all
+		end
+	end
+	return out
+end
+
+function LehuaClass.TraitInfo(trait: Trait): TraitReport
+	if not isTrait(trait) then
+		error("TraitInfo expects a Trait", 2)
+	end
+
+	local flat: { Trait } = {}
+	flattenTrait(trait, flat, {})
+
+	local uses: { string } = {}
+	local public: MemberTable = {}
+	local private: MemberTable = {}
+	local mergedPublic: MemberTable = {}
+	local mergedPrivate: MemberTable = {}
+	local static: MemberTable = {}
+	local meta: MemberTable = {}
+	local requires: { [string]: string } = {}
+	local setups, readies = 0, 0
+
+	for _, member in ipairs(flat) do
+		if member ~= trait then
+			table.insert(uses, member.Name)
+		end
+		for k, v in pairs(member.Public) do public[k] = v end
+		for k, v in pairs(member.Private) do private[k] = v end
+		for k, v in pairs(member.MergedPublic) do mergedPublic[k] = v end
+		for k, v in pairs(member.MergedPrivate) do mergedPrivate[k] = v end
+		for k, v in pairs(member.Static) do static[k] = v end
+		for k, v in pairs(member.Meta) do meta[k] = v end
+		for k, v in pairs(member.Requires) do requires[k] = v end
+		setups += #member.Setups
+		readies += #member.Readies
+	end
+
+	table.sort(uses)
+	return {
+		Name = trait.Name,
+		Uses = uses,
+		Public = sortedKeys(public),
+		Private = sortedKeys(private),
+		MergedPublic = sortedKeys(mergedPublic),
+		MergedPrivate = sortedKeys(mergedPrivate),
+		Static = sortedKeys(static),
+		Meta = sortedKeys(meta),
+		Requires = requires,
+		Setups = setups,
+		Readies = readies,
+	}
 end
 
 function LehuaClass.TraitsOf(value: any): { Trait }
