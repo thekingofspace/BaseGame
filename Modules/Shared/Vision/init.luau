@@ -14,6 +14,8 @@ const Vision = {
     derive = Symbols.derive,
     ready = Symbols.ready,
     cleanup = Symbols.cleanup,
+    drawcall = Symbols.drawcall,
+    style = Symbols.style,
     mount = Symbols.mount,
 }
 
