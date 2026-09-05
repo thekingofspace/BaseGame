@@ -2,6 +2,8 @@ local Runtime = require(script.Parent.Link)
 const Capture = require(script.Parent.Capture)
 const Interpolate = require(script.Parent.Interpolate)
 const Style = require(script.Parent.Style)
+const Animation = require(script.Parent.Animate)
+const Flipbook = require(script.Parent.Flipbook)
 
 const Scope = {}
 Scope.__index = Scope
@@ -62,11 +64,7 @@ function Scope.new()
 end
 
 function Scope:Capture(Declaration: any)
-    const Vision = Capture.new(self, Declaration)
-
-    self.Owned[Vision] = true
-
-    return Vision
+    return Capture.new(self, Declaration)
 end
 
 function Scope:LoadStyle(Declaration: any)
@@ -86,6 +84,14 @@ function Scope:LoadStyle(Declaration: any)
     Sheet:Load(Declaration)
 
     return Sheet
+end
+
+function Scope:Animate(Keyframes: { any }, Target: any)
+    return Animation.new(self, Keyframes, Target)
+end
+
+function Scope:FlipBook(Sheet: any, Object: Instance, Frames: { string }, Rate: number?)
+    return Flipbook.new(self, Sheet, Object, Frames, Rate)
 end
 
 function Scope:Update(EventName: string, Value: any)
@@ -243,6 +249,7 @@ const function Channel(Owner: any, Name: string, Current: any, Goal: any, Write:
         Owner = Owner,
         Name = Name,
         Kind = Kind,
+        Make = Interpolate.Maker(Kind),
         Position = Position,
         Velocity = Velocity,
         Goal = Target,

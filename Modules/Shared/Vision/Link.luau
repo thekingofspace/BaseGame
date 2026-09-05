@@ -8,8 +8,320 @@ Link.__index = Link
 local Runtime = {}
 Runtime.__index = Runtime
 
-const Rate = 240
 const Epsilon = 0.0005
+const Critical = 1e-4
+
+const function Coefficients(Omega: number, Damping: number, DeltaTime: number)
+    const Decay = Damping * Omega
+
+    if Damping < 1 - Critical then
+        const Ring = Omega * math.sqrt(1 - Damping * Damping)
+        const Fade = math.exp(-Decay * DeltaTime)
+        const Cos = math.cos(Ring * DeltaTime)
+        const Sin = math.sin(Ring * DeltaTime) / Ring
+
+        return Fade * (Cos + Decay * Sin), Fade * Sin, -Fade * Omega * Omega * Sin, Fade * (Cos - Decay * Sin)
+    end
+
+    if Damping <= 1 + Critical then
+        const Fade = math.exp(-Omega * DeltaTime)
+        const Span = Fade * DeltaTime
+
+        return Fade + Omega * Span, Span, -Omega * Omega * Span, Fade - Omega * Span
+    end
+
+    const Root = Omega * math.sqrt(Damping * Damping - 1)
+    const Fast = math.exp((Root - Decay) * DeltaTime)
+    const Slow = math.exp((-Root - Decay) * DeltaTime)
+    const Cosh = (Fast + Slow) * 0.5
+    const Sinh = (Fast - Slow) * 0.5 / Root
+
+    return Cosh + Decay * Sinh, Sinh, -Omega * Omega * Sinh, Cosh - Decay * Sinh
+end
+
+const function Springs(Easing: any): boolean
+    return type(Easing) == "table"
+        and typeof(Easing) ~= "TweenInfo"
+        and (Easing.Damping ~= nil or Easing.Dampening ~= nil or Easing.Period ~= nil)
+end
+
+const function Solve(Track: any, Put: (string, any) -> (), DeltaTime: number): boolean
+    const Carry, Push, Pull, Keep = Coefficients(Track.Omega, Track.Damping, DeltaTime)
+    const Position = Track.Position
+    const Velocity = Track.Velocity
+    const Goal = Track.Goal
+    const Count = #Position
+
+    local Done = true
+
+    for Index = 1, Count do
+        const Offset = Position[Index] - Goal[Index]
+        const Speed = Velocity[Index]
+
+        Position[Index] = Goal[Index] + Carry * Offset + Push * Speed
+        Velocity[Index] = Pull * Offset + Keep * Speed
+
+        const Scale = math.max(1, math.abs(Goal[Index]))
+
+        if
+            math.abs(Position[Index] - Goal[Index]) > Epsilon * Scale
+            or math.abs(Velocity[Index]) > Epsilon * Scale
+        then
+            Done = false
+        end
+    end
+
+    if Done then
+        for Index = 1, Count do
+            Position[Index] = Goal[Index]
+            Velocity[Index] = 0
+        end
+    end
+
+    Put(Track.Property, Track.Make(Position))
+
+    return Done
+end
+
+const function Enter(Track: any, Peek: (string) -> any, Head: any, Tail: any)
+    Track.From = if Track.Springy then Peek(Track.Property) else Head.Value
+
+    const Easing = Tail.Easing
+
+    if not Springs(Easing) then
+        Track.Springy = false
+
+        return
+    end
+
+    const Span = Tail.Time - Head.Time
+    const Period = Easing.Period or (if Span > 0 then Span else 0.5)
+
+    Track.Springy = true
+    Track.Omega = 2 * math.pi / math.max(Period, 1e-4)
+    Track.Damping = math.max(Easing.Damping or Easing.Dampening or 0, 0)
+
+    const Start = Interpolate.Components(Track.From)
+    const Goal = Interpolate.Components(Tail.Value)
+
+    if not Start or not Goal then
+        error(`{Track.Property} cannot be solved by a physics keyframe, use a TweenInfo instead`, 0)
+    end
+
+    if Track.Position then
+        for Index = 1, math.min(#Track.Position, #Goal) do
+            Track.Goal[Index] = Goal[Index]
+        end
+    else
+        Track.Position = Start
+        Track.Velocity = table.create(#Start, 0)
+        Track.Goal = Goal
+        Track.Make = Interpolate.Maker(typeof(Track.From))
+    end
+end
+
+const function Blank(Tracks: { any })
+    for _, Track in Tracks do
+        Track.Index = 0
+        Track.From = nil
+        Track.Home = nil
+        Track.Curve = nil
+        Track.Blend = nil
+        Track.Springy = false
+        Track.Position = nil
+        Track.Velocity = nil
+        Track.Goal = nil
+    end
+end
+
+const function Rewind(Self)
+    Self.Elapsed = if Self.Length > 0 then Self.Elapsed % Self.Length else 0
+    Self.Cursor = 1
+
+    Blank(Self.Tracks)
+end
+
+const function Restage(Self)
+    const Peek = Self.Peek
+    const Span = math.max(Self.RestageTime, 1e-4)
+
+    Self.Elapsed = 0
+    Self.Cursor = 1
+    Self.Restaging = true
+    Self.Staged = 0
+
+    for _, Track in Self.Tracks do
+        const Stops = Track.Stops
+        const Home = Stops[1].Value
+        const Style = Stops[#Stops].Easing
+
+        Track.Index = 0
+        Track.From = nil
+        Track.Home = Home
+        Track.Curve = Style
+
+        Enter(Track, Peek, { Time = 0, Value = Peek(Track.Property) }, { Time = Span, Value = Home, Easing = Style })
+    end
+end
+
+const function Timeline(Self, DeltaTime: number): boolean
+    const Tick = DeltaTime * Self.Speed
+
+    if Self.Restaging then
+        Self.Staged += Tick
+
+        const Span = Self.RestageTime
+        const Raw = if Span > 0 then math.min(Self.Staged / Span, 1) else 1
+        const Put = Self.Put
+
+        local Ready = Raw >= 1
+
+        for _, Track in Self.Tracks do
+            if Track.Springy then
+                if not Solve(Track, Put, DeltaTime) then
+                    Ready = false
+                end
+            else
+                const Shape = Track.Curve
+                const Curve = if Shape and typeof(Shape) == "TweenInfo" then Interpolate.Curve(Shape, Raw) else Raw
+
+                Put(Track.Property, Interpolate.Value(Track.From, Track.Home, Curve))
+            end
+        end
+
+        if Ready then
+            Self.Restaging = false
+
+            for _, Track in Self.Tracks do
+                Track.From = nil
+                Track.Home = nil
+                Track.Curve = nil
+            end
+        end
+
+        return false
+    end
+
+    Self.Elapsed += Tick
+
+    if Self.Looped and Self.Length > 0 and Self.Elapsed >= Self.Length then
+        if Self.SmoothLoop and Self.RestageTime > 0 then
+            Restage(Self)
+
+            return false
+        end
+
+        Rewind(Self)
+    end
+
+    const Now = Self.Elapsed
+    const Peek = Self.Peek
+    const Put = Self.Put
+    const Marks = Self.Marks
+    const Total = #Marks
+
+    const Fresh = not Self.Primed
+
+    Self.Primed = true
+
+    if not Fresh then
+        local Cursor = Self.Cursor
+
+        while Cursor <= Total and Marks[Cursor].Time <= Now do
+            const Mark = Marks[Cursor]
+
+            Cursor += 1
+            Self.Cursor = Cursor
+            Self.Fire(Mark.Name, Mark.Args)
+        end
+
+        Self.Cursor = Cursor
+    end
+
+    local Resting = Now >= Self.Length
+
+    for _, Track in Self.Tracks do
+        const Stops = Track.Stops
+        const Count = #Stops
+        local Index = Track.Index
+
+        while Index < Count and Now >= Stops[Index + 1].Time do
+            Index += 1
+            Track.Index = Index
+            Track.From = nil
+        end
+
+        if Index == 0 then
+            Resting = false
+
+            continue
+        end
+
+        if Index >= Count then
+            if Track.Springy then
+                if not Solve(Track, Put, DeltaTime) then
+                    Resting = false
+                end
+            elseif Track.From == nil then
+                const Last = Stops[Count].Value
+
+                Put(Track.Property, Last)
+                Track.From = Last
+            end
+
+            continue
+        end
+
+        Resting = false
+
+        const Head = Stops[Index]
+        const Tail = Stops[Index + 1]
+
+        if Track.From == nil then
+            Enter(Track, Peek, Head, Tail)
+        end
+
+        if Track.Springy then
+            Solve(Track, Put, DeltaTime)
+
+            continue
+        end
+
+        const Span = Tail.Time - Head.Time
+        const Alpha = if Span > 0 then (Now - Head.Time) / Span else 1
+        const Curve = if Tail.Easing then Interpolate.Curve(Tail.Easing, Alpha) else math.clamp(Alpha, 0, 1)
+
+        Put(Track.Property, Interpolate.Value(Track.From, Tail.Value, Curve))
+    end
+
+    return Resting and not Fresh
+end
+
+const function Flip(Self, DeltaTime: number): boolean
+    Self.Elapsed += DeltaTime * Self.Speed
+
+    const Count = Self.Count
+    const Span = 1 / Self.Rate
+
+    local Index = math.floor(Self.Elapsed / Span) + 1
+    local Done = false
+
+    if Index > Count then
+        if Self.Looped then
+            Index = (Index - 1) % Count + 1
+        else
+            Index = Count
+            Done = true
+        end
+    end
+
+    if Index ~= Self.Index then
+        Self.Index = Index
+        Self.Show(Index)
+    end
+
+    return Done
+end
 
 const function Tween(Self, DeltaTime: number): boolean
     Self.Elapsed += DeltaTime
@@ -36,10 +348,7 @@ const function Tween(Self, DeltaTime: number): boolean
 end
 
 const function Physics(Self, DeltaTime: number): boolean
-    const Omega = Self.Omega
-    const Damping = Self.Damping
-    const Steps = math.clamp(math.ceil(DeltaTime * Rate), 1, 32)
-    const Slice = DeltaTime / Steps
+    const Carry, Push, Pull, Keep = Coefficients(Self.Omega, Self.Damping, DeltaTime)
     local Settled = true
 
     for _, Channel in Self.Channels do
@@ -48,14 +357,12 @@ const function Physics(Self, DeltaTime: number): boolean
         const Goal = Channel.Goal
         const Count = #Position
 
-        for _ = 1, Steps do
-            for Index = 1, Count do
-                const Offset = Position[Index] - Goal[Index]
-                const Accel = -(Omega * Omega) * Offset - 2 * Damping * Omega * Velocity[Index]
+        for Index = 1, Count do
+            const Offset = Position[Index] - Goal[Index]
+            const Speed = Velocity[Index]
 
-                Velocity[Index] += Accel * Slice
-                Position[Index] += Velocity[Index] * Slice
-            end
+            Position[Index] = Goal[Index] + Carry * Offset + Push * Speed
+            Velocity[Index] = Pull * Offset + Keep * Speed
         end
 
         local Done = true
@@ -81,7 +388,7 @@ const function Physics(Self, DeltaTime: number): boolean
             Settled = false
         end
 
-        Channel.Write(Interpolate.Rebuild(Channel.Kind, Position))
+        Channel.Write(Channel.Make(Position))
     end
 
     return Settled
@@ -98,6 +405,32 @@ function Link.new(Owner, Update)
         Threads = {},
         Watchers = {},
     }, Link)
+end
+
+function Link:Seek(Time: number)
+    if self.Finished or not self.Tracks then
+        return
+    end
+
+    const Now = math.clamp(Time, 0, self.Length)
+    const Marks = self.Marks
+    const Total = #Marks
+
+    self.Elapsed = Now
+    self.Restaging = false
+    self.Staged = 0
+
+    local Cursor = 1
+
+    while Cursor <= Total and Marks[Cursor].Time <= Now do
+        Cursor += 1
+    end
+
+    self.Cursor = Cursor
+
+    Blank(self.Tracks)
+
+    Timeline(self, 0)
 end
 
 function Link:Step(DeltaTime: number)
@@ -134,6 +467,14 @@ function Link:Cancel()
     local Threads = self.Threads
 
     self.Apply = nil
+    self.Tracks = nil
+    self.Marks = nil
+    self.Fire = nil
+    self.Show = nil
+    self.Peek = nil
+    self.Put = nil
+    self.Owner = nil
+    self.Object = nil
     self.Claims = nil
     self.Threads = nil
     self.Runtime = nil
@@ -158,6 +499,7 @@ end
 function Runtime.new()
     return setmetatable({
         Links = {},
+        Buffer = {},
         Claims = setmetatable({}, { __mode = "k" }),
         Connection = nil,
     }, Runtime)
@@ -260,7 +602,22 @@ function Runtime:Stop()
 end
 
 function Runtime:Step(DeltaTime: number)
-    for _, Target in table.clone(self.Links) do
+    const Links = self.Links
+    const Count = #Links
+
+    if Count == 0 then
+        return
+    end
+
+    const Buffer = self.Buffer
+
+    table.move(Links, 1, Count, 1, Buffer)
+
+    for Index = 1, Count do
+        const Target = Buffer[Index]
+
+        Buffer[Index] = nil
+
         if not Target.Finished then
             Target:Step(DeltaTime)
         end
@@ -337,6 +694,69 @@ function Runtime:Velocity(Owner: any, Name: string): { number }?
     end
 
     return nil
+end
+
+function Runtime:Flip(Object: Instance, Count: number, Rate: number, Show: (number) -> ())
+    const Target = Link.new(self, Flip)
+
+    Target.Object = Object
+    Target.Count = Count
+    Target.Rate = Rate
+    Target.Show = Show
+    Target.Index = 0
+    Target.Speed = 1
+    Target.Looped = false
+
+    self:Claim(Object, "ImageRectOffset", Target)
+    Guard(Target, { Object })
+
+    Target:Step(0)
+
+    if not Target.Finished then
+        self:Add(Target)
+    end
+
+    return Target
+end
+
+function Runtime:Play(Owner: any, Peek: (string) -> any, Put: (string, any) -> (), Tracks: { any }, Marks: { any }, Length: number, Fire: (string, { any }) -> (), Start: number?)
+    const Target = Link.new(self, Timeline)
+
+    Target.Owner = Owner
+    Target.Peek = Peek
+    Target.Put = Put
+    Target.Elapsed = math.clamp(Start or 0, 0, Length)
+    Target.Tracks = Tracks
+    Target.Marks = Marks
+    Target.Length = Length
+    Target.Fire = Fire
+    Target.Cursor = 1
+    Target.Speed = 1
+    Target.Looped = false
+    Target.SmoothLoop = false
+    Target.RestageTime = 0.25
+    Target.Restaging = false
+    Target.Staged = 0
+    Target.Primed = false
+
+    for _, Track in Tracks do
+        self:Claim(Owner, Track.Property, Target)
+    end
+
+    Guard(Target, { Owner })
+    Blank(Tracks)
+
+    if Target.Elapsed > 0 then
+        Target:Seek(Target.Elapsed)
+    end
+
+    Target:Step(0)
+
+    if not Target.Finished then
+        self:Add(Target)
+    end
+
+    return Target
 end
 
 function Runtime:Solve(Period: number, Damping: number, Channels: { any })

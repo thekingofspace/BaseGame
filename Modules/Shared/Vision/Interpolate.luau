@@ -230,6 +230,10 @@ function Interpolate.Rebuild(Kind: string, Parts: { number }): any
     return Shapes[Kind].Make(Parts)
 end
 
+function Interpolate.Maker(Kind: string)
+    return Shapes[Kind].Make
+end
+
 function Interpolate.Solvable(Value: any): boolean
     return Shapes[typeof(Value)] ~= nil
 end
@@ -257,6 +261,10 @@ function Interpolate.Cycle(Info: TweenInfo, Elapsed: number): (number, boolean)
     end
 
     return TweenService:GetValue(math.clamp(Alpha, 0, 1), Info.EasingStyle, Info.EasingDirection), false
+end
+
+function Interpolate.Curve(Info: TweenInfo, Alpha: number): number
+    return TweenService:GetValue(math.clamp(Alpha, 0, 1), Info.EasingStyle, Info.EasingDirection)
 end
 
 return Interpolate

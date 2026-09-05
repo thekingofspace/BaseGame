@@ -1,4 +1,6 @@
 const Symbols = require(script.Parent.Symbols)
+
+const Token = Symbols.Token
 const Viewport = require(script.Parent.Viewport)
 
 const Capture = {}
@@ -16,6 +18,7 @@ const Reserved = {
     tags = true,
     Tags = true,
     AttributeChanged = true,
+    FromParent = true,
 }
 
 const Settling = 64
@@ -122,20 +125,65 @@ const function Register(State, Name: string)
 end
 
 const function Parse(State, Declaration, Parent)
-    local ClassName = Declaration.ClassName
+    local Kind = "Class"
+    local Origin = Declaration.ClassName
+    local Sources = 0
 
-    if type(ClassName) ~= "string" then
+    const Borrowed = Declaration.FromParent
+
+    if Borrowed ~= nil then
+        if type(Borrowed) ~= "string" then
+            error("FromParent needs the name of a child to take", 0)
+        end
+
+        if not Parent then
+            error("FromParent needs a declaration around it to look inside", 0)
+        end
+
+        Kind = "Child"
+        Origin = Borrowed
+        Sources += 1
+    end
+
+    for _, Entry in ipairs(Declaration) do
+        if Symbols.Is(Entry) then
+            const What = Entry.Kind
+
+            if What == "Clone" or What == "Adopt" then
+                if typeof(Entry.Target) ~= "Instance" then
+                    error(
+                        `{if What == "Clone" then "fromClone" else "fromInstance"} needs an instance to take from`,
+                        0
+                    )
+                end
+
+                Kind = What
+                Origin = Entry.Target
+                Sources += 1
+            end
+        end
+    end
+
+    if Sources > 1 then
+        error("a declaration can only take its instance from one place", 0)
+    end
+
+    if Sources == 0 and type(Origin) ~= "string" then
         error("Declaration requires a ClassName", 0)
     end
 
     const Node = {
-        ClassName = ClassName,
+        Kind = Kind,
+        Origin = Origin,
+        Owned = Kind == "Class" or Kind == "Clone",
         Attributes = Declaration.attributes or Declaration.Attributes,
         AttributeChanged = Declaration.AttributeChanged,
         Tags = Declaration.tags or Declaration.Tags,
-        Properties = {},
+        Fields = nil,
+        Painted = nil,
         Children = {},
         Ready = {},
+        Receive = {},
         Draw = {},
         Cleanup = {},
         Transient = {},
@@ -148,15 +196,32 @@ const function Parse(State, Declaration, Parent)
 
     table.insert(State.Nodes, Node)
 
+    const Fields = {}
+    const Name = Declaration.Name
+    local Painted
+    local Slot = 0
+
     for Key, Value in Declaration do
         if type(Key) ~= "string" or Reserved[Key] then
             continue
         end
 
-        Node.Properties[Key] = Value
+        if type(Value) == "table" and getmetatable(Value) == Token then
+            if not Painted then
+                Painted = {}
+            end
+
+            table.insert(Painted, Key)
+            table.insert(Painted, Value)
+        else
+            Fields[Slot + 1] = Key
+            Fields[Slot + 2] = Value
+            Slot += 2
+        end
     end
 
-    local Name = Node.Properties.Name
+    Node.Fields = Fields
+    Node.Painted = Painted
 
     if type(Name) == "string" then
         State.Mounts[Name] = Node
@@ -190,6 +255,8 @@ const function Parse(State, Declaration, Parent)
                 table.insert(State.Derived, Event)
             elseif Kind == "Ready" then
                 table.insert(Node.Ready, Entry.Callback)
+            elseif Kind == "Receive" then
+                table.insert(Node.Receive, Entry.Callback)
             elseif Kind == "Cleanup" then
                 table.insert(Node.Cleanup, Entry.Callback)
             elseif Kind == "Draw" then
@@ -205,36 +272,90 @@ const function Parse(State, Declaration, Parent)
     return Node
 end
 
+const Wired = {}
+
+const function Take(Node): Instance
+    const Kind = Node.Kind
+
+    if Kind == "Class" then
+        return Instance.new(Node.Origin)
+    end
+
+    if Kind == "Clone" then
+        return Node.Origin:Clone()
+    end
+
+    if Kind == "Adopt" then
+        return Node.Origin
+    end
+
+    const Host = if Node.Parent then Node.Parent.Instance else nil
+    const Found = if Host then Host:FindFirstChild(Node.Origin) else nil
+
+    if not Found then
+        error(`FromParent found no child named "{Node.Origin}"`, 0)
+    end
+
+    return Found
+end
+
 const function Raise(State, Node)
-    const Object = Instance.new(Node.ClassName)
+    const Object = Take(Node)
+    const ClassName = Object.ClassName
 
     Node.Instance = Object
 
     const Pending = Node.Pending
+    const Fields = Node.Fields
 
     table.clear(Pending)
 
-    for Key, Value in Node.Properties do
-        if Symbols.Styled(Value) then
-            const Sheet = State.Scope.Styles[Value.Style]
+    local Known = Wired[ClassName]
 
-            if not Sheet then
-                error(`style "{Value.Style}" is not loaded on this scope`, 0)
-            end
+    if not Known then
+        Known = {}
+        Wired[ClassName] = Known
+    end
 
-            Object[Key] = Sheet:Get(Value.Field)
-            table.insert(Node.Connections, Sheet:Attach(Object, Key, Value.Field))
+    local Slot = 0
 
-            continue
+    for Index = 1, #Fields, 2 do
+        const Key = Fields[Index]
+        const Value = Fields[Index + 1]
+
+        local Signal = Known[Key]
+
+        if Signal == nil then
+            Signal = typeof(Object[Key]) == "RBXScriptSignal"
+            Known[Key] = Signal
         end
 
-        const Member = Object[Key]
-
-        if typeof(Member) == "RBXScriptSignal" then
-            table.insert(Pending, Member)
-            table.insert(Pending, Value)
+        if Signal then
+            Pending[Slot + 1] = Object[Key]
+            Pending[Slot + 2] = Value
+            Slot += 2
         else
             Object[Key] = Value
+        end
+    end
+
+    const Painted = Node.Painted
+
+    if Painted then
+        const Sheets = State.Scope.Styles
+        const Connections = Node.Connections
+
+        for Index = 1, #Painted, 2 do
+            const Key = Painted[Index]
+            const Token = Painted[Index + 1]
+            const Sheet = Sheets[Token.Style]
+
+            if not Sheet then
+                error(`style "{Token.Style}" is not loaded on this scope`, 0)
+            end
+
+            Object[Key] = Sheet:Get(Token.Field)
+            Connections[#Connections + 1] = Sheet:Attach(Object, Key, Token.Field)
         end
     end
 
@@ -256,22 +377,77 @@ const function Raise(State, Node)
 
     if Node.AttributeChanged then
         for Key, Callback in Node.AttributeChanged do
-            table.insert(Pending, Object:GetAttributeChangedSignal(Key))
-            table.insert(Pending, Callback)
+            Pending[Slot + 1] = Object:GetAttributeChangedSignal(Key)
+            Pending[Slot + 2] = Callback
+            Slot += 2
+        end
+    end
+end
+
+const function Build(State)
+    const Nodes = State.Nodes
+
+    for Index = 1, #Nodes do
+        Raise(State, Nodes[Index])
+    end
+end
+
+const function Offer(Host, Pending: Instance, Source): Instance?
+    const Other = Internal[Host]
+
+    if not Other or not Other.Mounted then
+        return nil
+    end
+
+    for _, Node in Other.Nodes do
+        const Object = Node.Instance
+
+        if Object then
+            for _, Callback in Node.Receive do
+                const Taken = Callback(Object, Pending, Source)
+
+                if typeof(Taken) == "Instance" then
+                    return Taken
+                end
+            end
         end
     end
 
+    return nil
 end
 
-const function Build(State, Node)
-    Raise(State, Node)
+const function Graft(State, Node, Target, Source): Instance?
+    const Pending = Node.Instance
 
-    for _, Child in Node.Children do
-        Build(State, Child)
+    if not Pending then
+        return nil
     end
+
+    const Handle = State.Handle
+
+    for _, Host in Target.Hosts do
+        const Spot = Offer(Host, Pending, Source)
+
+        if Spot then
+            table.insert(
+                Node.Connections,
+                Pending.Destroying:Connect(function()
+                    const Owner = Handle[1]
+
+                    if Owner then
+                        Owner:Cleanup()
+                    end
+                end)
+            )
+
+            return Spot
+        end
+    end
+
+    return nil
 end
 
-const function Resolve(State, Node): Instance?
+const function Resolve(State, Node, Source): Instance?
     local Target = Node.Target
 
     if typeof(Target) == "Instance" then
@@ -282,6 +458,10 @@ const function Resolve(State, Node): Instance?
         const Found = State.Mounts[Target]
 
         return if Found then Found.Instance else nil
+    end
+
+    if Symbols.Injected(Target) then
+        return Graft(State, Node, Target, Source)
     end
 
     return if Node.Parent then Node.Parent.Instance else nil
@@ -490,7 +670,7 @@ const function Teardown(Node)
     end
 end
 
-const function Finish(State)
+const function Finish(State, Source)
     Activate(State)
     Settle(State)
 
@@ -506,7 +686,9 @@ const function Finish(State)
 
     Paint(State.Root, Viewport.Current())
 
-    State.Root.Instance.Parent = Resolve(State, State.Root)
+    if State.Root.Owned or State.Root.Target ~= nil then
+        State.Root.Instance.Parent = Resolve(State, State.Root, Source)
+    end
 
     Ready(State.Root)
     Attach(State.Root)
@@ -517,6 +699,12 @@ function Methods:Mount()
     const State = Internal[self]
 
     if State.Mounted then
+        const Root = State.Root.Instance
+
+        if Root and Root.Parent == nil and Symbols.Injected(State.Root.Target) then
+            Root.Parent = Resolve(State, State.Root, self)
+        end
+
         return
     end
 
@@ -524,15 +712,15 @@ function Methods:Mount()
     State.Generation += 1
     State.Scope:Adopt(self)
 
-    Build(State, State.Root)
+    Build(State)
 
     for _, Node in State.Nodes do
-        if Node ~= State.Root then
-            Node.Instance.Parent = Resolve(State, Node)
+        if Node ~= State.Root and (Node.Owned or Node.Target ~= nil) then
+            Node.Instance.Parent = Resolve(State, Node, self)
         end
     end
 
-    Finish(State)
+    Finish(State, self)
 end
 
 function Methods:MountAsync(Budget: number?)
@@ -575,7 +763,10 @@ function Methods:MountAsync(Budget: number?)
 
     for Index = 1, #Nodes do
         Raise(State, Nodes[Index])
-        table.insert(Built, Nodes[Index].Instance)
+
+        if Nodes[Index].Owned then
+            table.insert(Built, Nodes[Index].Instance)
+        end
 
         if Spent() then
             return
@@ -585,8 +776,8 @@ function Methods:MountAsync(Budget: number?)
     for Index = 1, #Nodes do
         const Node = Nodes[Index]
 
-        if Node ~= State.Root then
-            Node.Instance.Parent = Resolve(State, Node)
+        if Node ~= State.Root and (Node.Owned or Node.Target ~= nil) then
+            Node.Instance.Parent = Resolve(State, Node, self)
         end
 
         if Spent() then
@@ -594,7 +785,7 @@ function Methods:MountAsync(Budget: number?)
         end
     end
 
-    Finish(State)
+    Finish(State, self)
 end
 
 function Methods:Open(): Instance
@@ -637,8 +828,10 @@ function Methods:Cleanup()
         end
     end
 
-    if State.Root.Instance then
-        State.Root.Instance:Destroy()
+    for _, Node in State.Nodes do
+        if Node.Owned and Node.Instance then
+            Node.Instance:Destroy()
+        end
     end
 
     for _, Node in State.Nodes do
@@ -650,6 +843,16 @@ end
 
 function Methods:Clone()
     const State = Internal[self]
+
+    for _, Node in State.Nodes do
+        if Node.Kind == "Adopt" then
+            error(
+                "this vision cannot be cloned, it takes an existing instance with fromInstance and there is only one of those, use fromClone instead",
+                0
+            )
+        end
+    end
+
     const Copy = State.Scope:Capture(State.Declaration)
     const Fresh = Internal[Copy]
 
@@ -679,6 +882,7 @@ function Capture.new(Scope, Declaration)
         Derived = {},
         Mounts = {},
         Nodes = {},
+        Handle = setmetatable({}, { __mode = "v" }),
         Root = nil,
         Mounted = false,
         Generation = 0,
@@ -689,6 +893,7 @@ function Capture.new(Scope, Declaration)
     end
 
     Internal[Vision] = State
+    State.Handle[1] = Vision
     State.Root = Parse(State, Declaration, nil)
 
     for _, Event in State.Derived do
