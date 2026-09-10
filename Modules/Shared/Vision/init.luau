@@ -1,9 +1,12 @@
+--!strict
+
 const Symbols = require(script.Symbols)
 const Scope = require(script.Scope)
 const Types = require(script.Types)
 const Lint = require(script.Lint)
 const Create = require(script.Create)
 const Page = require(script.Sheet)
+const Classes = require(script.Classes)
 
 export type CapFunc<v> = Types.CapFunc<v>
 export type Vision = Types.Vision
@@ -20,6 +23,7 @@ const Vision = {
     drawcall = Symbols.drawcall,
     style = Symbols.style,
     mount = Symbols.mount,
+    fromEvent = Symbols.fromEvent,
     fromClone = Symbols.fromClone,
     fromInstance = Symbols.fromInstance,
     inject = Symbols.inject,
@@ -27,6 +31,8 @@ const Vision = {
     Keyframe = Symbols.Keyframe,
 
     Sheet = Page.new,
+
+    class = Classes.new,
 
     lint = Lint,
     create = Create,

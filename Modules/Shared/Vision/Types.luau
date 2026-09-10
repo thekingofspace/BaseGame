@@ -1,3 +1,5 @@
+--!strict
+
 export type CapFunc<v> = (i:v?) -> v
 
 export type Vision = {
@@ -5,8 +7,9 @@ export type Vision = {
     Mount:(self:Vision) -> (),
     Open:(self:Vision) -> Instance,
     MountAsync:(self:Vision, Budget:number?) -> (),
-    Clone:(self:Vision) -> Vision
-} & {[string]:CapFunc<any>}
+    Clone:(self:Vision) -> Vision,
+    [string]:CapFunc<any>
+}
 
 export type Marker = {
     Kind:string,
@@ -16,7 +19,12 @@ export type Marker = {
     Target:(Instance | string)?
 }
 
+export type Dynamic = {[string]:any}
+
 export type Declaration = {[any]:any}
+
+export type AttributeChanged = {[string]:(self:Instance, vision:Vision, Value:any) -> ()}
+export type PropertyChanged = {[string]:(self:Instance, vision:Vision, Value:any) -> ()}
 
 export type Graft = {Hosts:{Vision}}
 
@@ -26,20 +34,30 @@ export type Style = {
     Set:(self:Style, Field:string, Value:any) -> ()
 }
 
-export type event = (Event:string, InitialValue:any, Callback:(self:Instance, Value:any) -> ()) -> Marker
-export type merge = (Event:string, Callback:(self:Instance, Value:any) -> ()) -> Marker
+export type event = (Event:string, InitialValue:any, Callback:(self:Instance, vision:Vision, Value:any) -> ()) -> Marker
+export type merge = (Event:string, Callback:(self:Instance, vision:Vision, Value:any) -> ()) -> Marker
 export type derive = (Event:string, Compute:(Mode:string, Read:(Event:string) -> any, Write:(Event:string, Value:any) -> any, Value:any) -> any) -> Marker
-export type ready = (Callback:(self:Instance, cleanup:(Callback:(self:Instance) -> ()) -> ()) -> ()) -> Marker
-export type cleanup = (Callback:(self:Instance) -> ()) -> Marker
-export type drawcall = (Callback:(self:Instance, Viewport:Vector2) -> ()) -> Marker
+export type ready = (Callback:(self:Instance, vision:Vision, cleanup:(Callback:(self:Instance, vision:Vision) -> ()) -> ()) -> ()) -> Marker
+export type cleanup = (Callback:(self:Instance, vision:Vision) -> ()) -> Marker
+export type drawcall = (Callback:(self:Instance, vision:Vision, Viewport:Vector2) -> ()) -> Marker
 export type mount = (Target:Instance | string | Graft) -> Marker
 export type fromClone = (Template:Instance) -> Marker
 export type fromInstance = (Existing:Instance) -> Marker
-export type receive = (Callback:(self:Instance, Target:Instance, Source:Vision) -> Instance?) -> Marker
+export type receive = (Callback:(self:Instance, vision:Vision, Target:Instance, Source:Vision) -> Instance?) -> Marker
 export type inject = (...Vision) -> Graft
 export type lint = (Declaration:Declaration) -> {string}
 export type create = (Declaration:Declaration) -> Instance
 export type style = (Name:string) -> {[string]:any}
+export type fromEvent = (Event:string, InitialValue:any?) -> any
+
+export type Class = {
+    Base:string,
+    Properties:{[string]:any},
+    Construct:(Made:{[string]:any}) -> Declaration,
+    Changed:{[string]:(self:Instance, vision:Vision, Value:any) -> ()}?
+}
+
+export type class = (Name:string, Definition:Class) -> string
 
 export type Keyframe = {
     Easing:TweenInfo | {Period:number?, Damping:number?, Dampening:number?},

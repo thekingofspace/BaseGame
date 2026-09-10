@@ -1,3 +1,5 @@
+--!strict
+
 local Runtime = require(script.Parent.Link)
 const Capture = require(script.Parent.Capture)
 const Interpolate = require(script.Parent.Interpolate)
@@ -5,8 +7,20 @@ const Style = require(script.Parent.Style)
 const Animation = require(script.Parent.Animate)
 const Flipbook = require(script.Parent.Flipbook)
 
+type StyleSheet = {
+    Name: string,
+    Get: (self: StyleSheet, Field: string) -> any,
+    Set: (self: StyleSheet, Field: string, Value: any) -> (),
+    Load: (self: StyleSheet, Declaration: { [string]: any }) -> (),
+    Release: (self: StyleSheet) -> (),
+}
+
+type Owners = { [any]: boolean }
+
 const Scope = {}
 Scope.__index = Scope
+
+const Live: { [any]: boolean } = {}
 
 const function AsList(Value: any): { any }
     if typeof(Value) == "Instance" or Capture.Is(Value) then
@@ -57,8 +71,8 @@ end
 function Scope.new()
     return setmetatable({
         Runtime = Runtime.new(),
-        Visions = {},
-        Styles = {},
+        Visions = {} :: { any },
+        Styles = {} :: { [string]: StyleSheet },
         Owned = setmetatable({}, { __mode = "k" }),
     }, Scope)
 end
@@ -74,10 +88,10 @@ function Scope:LoadStyle(Declaration: any)
         error("a style declaration needs a name", 0)
     end
 
-    local Sheet = self.Styles[Name]
+    local Sheet: StyleSheet = self.Styles[Name]
 
     if not Sheet then
-        Sheet = Style.new(Name)
+        Sheet = (Style.new(Name) :: any) :: StyleSheet
         self.Styles[Name] = Sheet
     end
 
@@ -95,7 +109,7 @@ function Scope:FlipBook(Sheet: any, Object: Instance, Frames: { string }, Rate: 
 end
 
 function Scope:Update(EventName: string, Value: any)
-    for Vision in self.Owned do
+    for Vision in self.Owned :: Owners do
         if type(Vision[EventName]) == "function" then
             Vision[EventName](Value)
         end
@@ -108,6 +122,8 @@ function Scope:Adopt(Vision: any)
     if not table.find(self.Visions, Vision) then
         table.insert(self.Visions, Vision)
     end
+
+    Live[self] = true
 end
 
 function Scope:Forget(Vision: any)
@@ -117,6 +133,10 @@ function Scope:Forget(Vision: any)
 
     if Index then
         table.remove(self.Visions, Index)
+    end
+
+    if #self.Visions == 0 then
+        Live[self] = nil
     end
 end
 
@@ -222,7 +242,7 @@ function Scope:SpringFunction(
 )
     return self.Runtime:Create(Info, function(Alpha: number, DeltaTime: number)
         TargetFun(Interpolate.Value(InitialValue, TargetValue, Alpha), DeltaTime)
-    end, { { TargetFun, "" } })
+    end, { { TargetFun, "" } :: { any } })
 end
 
 const function Channel(Owner: any, Name: string, Current: any, Goal: any, Write: (any) -> ())
@@ -342,8 +362,14 @@ function Scope:PhysicsFunction(
 end
 
 function Scope:Release()
-    for _, Vision in table.clone(self.Visions) do
-        Vision:Cleanup()
+    local Fault = nil
+
+    for _, Vision in table.clone(self.Visions) :: { any } do
+        const Ok, Err = pcall(Vision.Cleanup, Vision)
+
+        if not Ok and Fault == nil then
+            Fault = Err
+        end
     end
 
     for _, Sheet in self.Styles do
@@ -352,8 +378,14 @@ function Scope:Release()
 
     table.clear(self.Visions)
     table.clear(self.Owned)
+
+    Live[self] = nil
     table.clear(self.Styles)
     self.Runtime:Release()
+
+    if Fault ~= nil then
+        error(Fault, 0)
+    end
 end
 
 return Scope

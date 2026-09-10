@@ -1,33 +1,20 @@
 {
-  "name": "BaseGame",
-  "tree": {
-    "$className": "DataModel",
+    "ProjectID": "BaseGame",
+    "Name": "BaseGame",
 
     "ReplicatedStorage": {
-      "Shared": {
-        "$path": "Modules/Shared"
-      }
+        "Shared": { "$Path": "Modules/Shared" }
     },
 
-    "ServerStorage":{
-      "ServerModules":{
-        "$path":"Modules/Server"
-      }
+    "ServerStorage": {
+        "ServerModules": { "$Path": "Modules/Server" }
     },
 
     "ServerScriptService": {
-      "Server": {
-        "$path": "src/server"
-      }
+        "Server": { "$Path": "src/server" }
     },
 
-    "StarterPlayer": {
-      "StarterPlayerScripts": {
-        "$className": "StarterPlayerScripts",
-        "Client": {
-          "$path": "src/client"
-        }
-      }
+    "StarterPlayer/StarterPlayerScripts": {
+        "Client": { "$Path": "src/client" }
     }
-  }
 }

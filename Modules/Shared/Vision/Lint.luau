@@ -1,4 +1,18 @@
+--!strict
+
 const Symbols = require(script.Parent.Symbols)
+
+type Declaration = { [any]: any }
+
+type Report = {
+    Notes: { string },
+    Names: { [string]: string },
+    Declared: { [string]: boolean },
+    Derived: { [string]: boolean },
+    Used: { [string]: boolean },
+    Read: { [string]: string },
+    Wants: { { Name: string, Path: string } },
+}
 
 const Protected = {
     Mount = true,
@@ -8,7 +22,7 @@ const Protected = {
     Clone = true,
 }
 
-const function Sourced(Declaration: any): boolean
+const function Sourced(Declaration: Declaration): boolean
     if type(Declaration.FromParent) == "string" then
         return true
     end
@@ -22,7 +36,7 @@ const function Sourced(Declaration: any): boolean
     return false
 end
 
-const function Walk(Declaration: any, Trail: string, Found: any)
+const function Walk(Declaration: Declaration, Trail: string, Found: Report)
     const ClassName = Declaration.ClassName
     const Borrowed = Sourced(Declaration)
     const Named = if type(ClassName) == "string" then ClassName elseif Borrowed then "taken" else "?"
@@ -50,7 +64,33 @@ const function Walk(Declaration: any, Trail: string, Found: any)
         end
     end
 
+    for Key, Value in Declaration do
+        if type(Key) == "string" and Symbols.Bound(Value) then
+            const Name = Value.Name
+
+            Found.Used[Name] = true
+
+            if Value.Initial == nil then
+                Found.Read[Name] = Path
+            elseif Found.Declared[Name] then
+                table.insert(
+                    Found.Notes,
+                    `{Path} gives "{Name}" a starting value on {Key}, but it is already declared, so it is ignored`
+                )
+            else
+                Found.Declared[Name] = true
+            end
+        end
+    end
+
     for _, Entry in ipairs(Declaration) do
+        if Symbols.Bound(Entry) then
+            table.insert(
+                Found.Notes,
+                `{Path} has a fromEvent in its array part, it only works as a property value`
+            )
+        end
+
         if Symbols.Is(Entry) then
             const Kind = Entry.Kind
             const Name = Entry.Name
@@ -102,7 +142,7 @@ const function Lint(Declaration: any): { string }
         error("lint expects a declaration table", 0)
     end
 
-    const Found = {
+    const Found: Report = {
         Notes = {},
         Names = {},
         Declared = {},
@@ -131,7 +171,7 @@ const function Lint(Declaration: any): { string }
 
     table.sort(Found.Notes)
 
-    const Shout = if type(warn) == "function" then warn else print
+    const Shout: (...any) -> () = if type(warn) == "function" then warn else print
 
     for _, Note in Found.Notes do
         Shout(`[vision lint] {Note}`)
