@@ -675,7 +675,14 @@ local function buildInnerMeta(def: ClassDef): MemberTable
 				(control.Set :: Method)(fields, value)
 				return
 			end
-			if staticLookup(def, key) ~= nil and writeStatic(def, key, value) then
+			if staticLookup(def, key) ~= nil then
+				if writeStatic(def, key, value) then
+					return
+				end
+				if value == nil then
+					error(("class '%s': statics cannot hold nil"):format(def.name), 2)
+				end
+				def.ownStatics[key] = value
 				return
 			end
 			rawset(fields, key, value)
