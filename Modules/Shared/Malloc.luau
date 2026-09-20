@@ -1,6 +1,357 @@
 --!strict
 --!optimize 2
 
+--[[
+	Malloc
+
+	A memory allocator that keeps everything inside Luau buffers.
+
+	You ask it for one big block of bytes up front. After that you hand out
+	small pieces of that block, write values into them, and give them back
+	when you are done. Nothing is stored in Luau tables, so the garbage
+	collector never has to look at any of it. There is one table per arena
+	and that is all.
+
+	Every piece you hand out is called a block, and you refer to it by its
+	address, which is just a number. Numbers cost nothing to pass around,
+	copy, or store inside another block.
+
+
+	GETTING STARTED
+
+		local Malloc = require(ReplicatedStorage.Shared.Malloc)
+
+		local arena = Malloc.Alloc(4096)
+
+		local spot = arena:GenerateAddress(Malloc.Types.Vector3)
+		arena:Write(spot, Vector3.new(1, 2, 3))
+		print(arena:Read(spot))
+
+		arena:Free(spot)
+
+
+	HOW THE MEMORY IS LAID OUT
+
+	The arena is one buffer. It is cut into chunks that sit right next to
+	each other with no gaps. Every chunk looks like this.
+
+		8 bytes of header
+		the payload, which is what you actually use
+		4 bytes of footer
+
+	The header holds the payload size, a flags byte, the type id, and a
+	two byte marker used to spot damaged memory. The footer holds the same
+	size again. Keeping the size at both ends is what lets a block find the
+	chunk in front of it in one step, which matters when freeing.
+
+	So a block costs 12 bytes on top of whatever you asked for. The
+	smallest payload is 8 bytes, because free blocks store two links inside
+	their own payload.
+
+	Free blocks are joined together in a chain. When you free a block it
+	checks the chunks on either side, and if they are free too it merges
+	with them into one larger free block. This means two free blocks can
+	never sit next to each other, and an empty arena always collapses back
+	into a single free block.
+
+	When you ask for memory the allocator walks the free chain and picks the
+	block that fits with the least waste left over. If the leftover is big
+	enough to become its own chunk it is split off. If it is too small to
+	stand alone and the next chunk is free, the leftover is handed to that
+	neighbour instead of being wasted.
+
+
+	ADDRESSES
+
+	An address is the byte offset of a payload inside the arena buffer.
+	Address 0 never happens, so 0 doubles as the null address. If a request
+	cannot be met you get nil back instead of an error, the same way malloc
+	returns null in C. Always check the result.
+
+		local spot = arena:GenerateAddress(64)
+
+		if spot == nil then
+			warn("out of room")
+			return
+		end
+
+	Addresses stay valid until you free the block or resize it. Growing a
+	block can move it, so use the address that Realloc or Resize gives back.
+
+
+	TYPES
+
+	Malloc.Types holds the value types you can store. Each one knows its
+	size and how to turn a value into bytes and back.
+
+		Bool  U8  I8  U16  I16  U32  I32  F32  F64  Address
+		Vector2  Vector3  Rect  NumberRange  UDim  UDim2
+		Color3  Color3Float
+		CFrame  CFramePrecise  CFrameExact  Quaternion
+
+	Two of them are built at the moment you ask for them, so that you can
+	pick the size.
+
+		Malloc.Types.Bytes(16)    raw bytes, holds a buffer or a string
+		Malloc.Types.String(16)   text up to 16 characters
+
+	The rotation types are worth knowing about because they trade accuracy
+	for space.
+
+		CFrame          16 bytes, position plus a squeezed rotation
+		CFramePrecise   28 bytes, position plus a full rotation
+		CFrameExact     48 bytes, every number kept exactly as it was
+		Quaternion       4 bytes, rotation only, no position
+
+	The squeezed rotation in CFrame is accurate to about a sixteenth of a
+	degree, which is plenty for most game work. If you need it perfect, use
+	CFramePrecise or CFrameExact.
+
+	Colors are three bytes by default, one per channel, which is how colors
+	are normally written anyway. Use Color3Float if you need the full range.
+
+	A block remembers its own type, so Write and Read only need the value.
+
+		local spot = arena:GenerateAddress(Malloc.Types.U32, 4)
+
+		arena:Write(spot, 100, 0)
+		arena:Write(spot, 200, 1)
+		print(arena:Read(spot, 1))
+
+	The last number is the slot, counting from 0. You can also ignore the
+	block type and read or write any type at any byte offset with WriteAs
+	and ReadAs.
+
+
+	MALLOC.NULL
+
+	Malloc.NULL is a value you can write anywhere. It wipes the bytes it is
+	written to and leaves the address alone. Use it when you want to empty
+	something without giving the memory back.
+
+		arena:Write(spot, Malloc.NULL)
+
+	Because all zero bytes are a valid reading of every type, a wiped block
+	reads back as an empty value. Numbers read 0, flags read false, text
+	reads empty, vectors read zero, and rotations read as no rotation.
+
+	Malloc.NULL_ADDRESS is the separate thing, the number 0, which is what
+	a stored pointer holds when it points at nothing. Malloc.IsNull covers
+	both of those plus nil.
+
+
+	ARRAYS
+
+	An array is a block that also tracks how many items you have put in it.
+	It costs 4 extra bytes and nothing more.
+
+		local list = arena:GenerateArray(Malloc.Types.Vector3, 64)
+
+		arena:Push(list, Vector3.new(1, 2, 3))
+		arena:Push(list, Vector3.new(4, 5, 6))
+
+		print(arena:Get(list, 0))
+		print(arena:Length(list))
+
+		arena:Iterate(list, function(index, value)
+			print(index, value)
+		end)
+
+	Slots count from 0. Length is how many items are in it right now and
+	CountOf is how many it can hold. Push returns nil when it is full.
+	Remove takes an item out and slides the rest down. Pop takes the last
+	one off.
+
+
+	DICTIONARIES
+
+	A dictionary maps keys to values. Both the key and the value are normal
+	Malloc types, so the whole thing lives in bytes.
+
+		local map = arena:GenerateDictionary(
+			Malloc.Types.String(16),
+			Malloc.Types.F32,
+			100
+		)
+
+		arena:Set(map, "health", 100)
+		print(arena:Get(map, "health"))
+		print(arena:Has(map, "health"))
+
+		arena:Remove(map, "health")
+
+	Inside, it is a table of slots. A key is turned into a number and that
+	number picks a starting slot. If the slot is taken it walks forward
+	until it finds a free one. Deleting slides the following keys back so
+	no dead markers are left behind, which keeps the table small and fast.
+
+	It asks for a few more slots than you need so that it never fills up
+	completely, since a completely full table of this kind gets very slow.
+	Three quarters full is the limit. Set returns false once it is full,
+	though it will still overwrite keys that are already there.
+
+	Keys match on their bytes. Two keys are the same key when they write
+	the same bytes. Worth keeping in mind for decimal number keys, where
+	negative zero and positive zero write differently.
+
+	Slot order is not the order you added things in, and it changes as you
+	add and remove. Do not rely on it.
+
+
+	RESIZING
+
+	Resize changes how much a collection can hold, in either direction.
+
+		list = arena:Resize(list, 128)
+		map = arena:Resize(map, 500)
+
+	Arrays usually stay where they are. Shrinking an array below what it
+	holds drops the items off the end.
+
+	Dictionaries always move, because the slot count is part of how keys
+	find their slot, so everything has to be placed again. The new address
+	is what Resize hands back. If you stored the old address somewhere,
+	write the new one over it. Shrinking a dictionary below what it holds
+	is refused, since there is no sensible answer for which entries to
+	throw away.
+
+	Grow does the same thing but refuses to drop array items, so use it
+	when losing data should be an error.
+
+
+	SENDING AN ARENA SOMEWHERE ELSE
+
+	Export gives you two buffers. One is a short description of everything
+	stored, and the other is the memory itself, cut off after the last
+	block in use. Import turns them back into an arena.
+
+		local metadata, image = arena:Export()
+
+		local restored, addresses = Malloc.Import(metadata, image)
+
+	Import also hands back a list of every address in the arena, in order,
+	so the other side knows what it received without being told.
+
+	Addresses are kept exactly as they were. That is what makes it safe to
+	store addresses inside blocks. You can keep one block full of addresses
+	that point at all the others, send the pair of buffers across, and the
+	pointers still work on the far side.
+
+	Types travel by name rather than by number, because the numbers depend
+	on which types each side happened to ask for first. Import reads the
+	names and looks them up again, and builds sized types like String16
+	back from scratch if it has to.
+
+	Import does not trust what it is given. It walks every chunk, checks
+	the markers, the sizes, and the footers, and makes sure the chunks fill
+	the arena exactly before handing anything back. Anything bent gets a
+	clear error instead of a broken arena.
+
+
+	SIZING AN ARENA
+
+	If you want an arena that is exactly big enough, add up what you plan
+	to put in it. These give the full cost including the 12 byte overhead.
+
+		Malloc.Reserve(Malloc.Types.Vector3, 10)
+		Malloc.ReserveArray(Malloc.Types.Vector3, 64)
+		Malloc.ReserveDictionary(Malloc.Types.String(16), Malloc.Types.F32, 100)
+
+
+	EVERYTHING YOU CAN CALL
+
+	On the module
+
+		Malloc.Alloc(bytes)                        make an arena
+		Malloc.Import(metadata, image)             rebuild a sent arena
+		Malloc.Is(value)                           is this an arena
+		Malloc.IsNull(value)                       nil, NULL, or address 0
+		Malloc.SizeOf(type, count)                 payload bytes needed
+		Malloc.Reserve(type, count)                payload plus overhead
+		Malloc.ReserveArray(type, capacity)        cost of an array
+		Malloc.ReserveDictionary(key, value, n)    cost of a dictionary
+		Malloc.Types                               the value types
+		Malloc.NULL                                the wipe value
+		Malloc.NULL_ADDRESS                        the number 0
+		Malloc.Overhead                            12
+
+	Blocks
+
+		arena:GenerateAddress(type or bytes, count)
+		arena:Free(address)
+		arena:Realloc(address, type or bytes, count)
+
+	Reading and writing
+
+		arena:Write(address, value, slot)
+		arena:Read(address, slot)
+		arena:WriteAs(address, type, value, offset)
+		arena:ReadAs(address, type, offset)
+		arena:WriteBytes(address, buffer or string, offset, count)
+		arena:ReadBytes(address, offset, count)
+		arena:WriteString(address, text, offset)
+		arena:ReadString(address, count, offset)
+		arena:Fill(address, byte, offset, count)
+		arena:Copy(destination, source, count)
+
+	Asking about a block
+
+		arena:SizeOf(address)        payload bytes
+		arena:CountOf(address)       how many it can hold
+		arena:TypeOf(address)        its type
+		arena:KindOf(address)        plain, array, or dictionary
+		arena:IsAllocated(address)   is it alive
+
+	Arrays and dictionaries
+
+		arena:GenerateArray(type, capacity)
+		arena:GenerateDictionary(key, value, entries)
+		arena:Push(address, value)
+		arena:Pop(address)
+		arena:Get(address, slot or key)
+		arena:Set(address, slot or key, value)
+		arena:Has(address, key)
+		arena:Remove(address, slot or key)
+		arena:Length(address)
+		arena:Clear(address)
+		arena:Iterate(address, callback)
+		arena:Resize(address, capacity)
+		arena:Grow(address, capacity)
+
+	The arena as a whole
+
+		arena:Capacity()       total bytes
+		arena:Used()           bytes handed out
+		arena:Available()      bytes free
+		arena:LargestFree()    biggest single free block
+		arena:Addresses()      every live address
+		arena:Each(callback)   walk every chunk, free ones included
+		arena:Stats()          a summary table
+		arena:Export()         metadata and memory buffers
+		arena:Reset()          free everything, keep the arena
+		arena:Release()        free everything and drop the memory
+
+
+	THINGS THAT WILL CATCH YOU OUT
+
+	Slots count from 0, not 1.
+
+	GenerateAddress and friends return nil when they cannot fit the
+	request. If you pass that nil along you get an error further down
+	saying no address was given.
+
+	Write and Read only work on plain blocks. Arrays and dictionaries use
+	Get, Set, and Push. The error message will tell you which to use.
+
+	Realloc works on plain blocks and Resize works on collections.
+
+	Do not add to or remove from a collection while Iterate is running.
+	Collect what you want to change and do it after the loop ends.
+
+	Release throws the memory away. Every address from that arena stops
+	working. Reset keeps the arena but empties it.
+]]
+
 local Malloc = {}
 
 export type TypeDef = {
@@ -8,6 +359,8 @@ export type TypeDef = {
 	name: string,
 	size: number,
 	kind: string?,
+	key: TypeDef?,
+	value: TypeDef?,
 	write: (target: buffer, offset: number, value: any) -> (),
 	read: (target: buffer, offset: number) -> any,
 }
@@ -59,6 +412,21 @@ export type Malloc = {
 	Addresses: (self: Malloc) -> { number },
 	Export: (self: Malloc) -> (buffer, buffer),
 
+	GenerateArray: (self: Malloc, element: TypeDef, capacity: number) -> number?,
+	GenerateDictionary: (self: Malloc, key: TypeDef, value: TypeDef, entries: number) -> number?,
+	KindOf: (self: Malloc, address: number) -> string,
+	Length: (self: Malloc, address: number) -> number,
+	Push: (self: Malloc, address: number, value: any) -> number?,
+	Pop: (self: Malloc, address: number) -> any,
+	Get: (self: Malloc, address: number, at: any) -> any,
+	Set: (self: Malloc, address: number, at: any, value: any) -> boolean,
+	Has: (self: Malloc, address: number, key: any) -> boolean,
+	Remove: (self: Malloc, address: number, at: any) -> any,
+	Clear: (self: Malloc, address: number) -> (),
+	Iterate: (self: Malloc, address: number, callback: (any, any) -> ()) -> (),
+	Resize: (self: Malloc, address: number, capacity: number) -> number?,
+	Grow: (self: Malloc, address: number, capacity: number) -> number?,
+
 	Reset: (self: Malloc) -> (),
 	Release: (self: Malloc) -> (),
 }
@@ -70,6 +438,19 @@ local ALIGNMENT = 4
 local MIN_PAYLOAD = 8
 local NULL_ADDRESS = 0
 local FLAG_USED = 1
+local KIND_MASK = 6
+local KIND_PLAIN = 0
+local KIND_ARRAY = 2
+local KIND_DICT = 4
+
+local ARRAY_LENGTH_AT = 0
+local ARRAY_HEADER = 4
+
+local DICT_COUNT_AT = 0
+local DICT_CAPACITY_AT = 4
+local DICT_HEADER = 8
+local DICT_LOAD = 0.75
+local DICT_MIN_SLOTS = 4
 local BLOCK_MAGIC = 0x4D41
 local MAX_TYPE_ID = 255
 
@@ -128,7 +509,8 @@ local function defineType(
 	size: number,
 	kind: string?,
 	write: (target: buffer, offset: number, value: any) -> (),
-	read: (target: buffer, offset: number) -> any
+	read: (target: buffer, offset: number) -> any,
+	pair: { key: TypeDef, value: TypeDef }?
 ): TypeDef
 	if nextTypeId > MAX_TYPE_ID then
 		fail("exhausted the type table, only " .. MAX_TYPE_ID .. " types can exist")
@@ -139,6 +521,8 @@ local function defineType(
 		name = name,
 		size = size,
 		kind = kind,
+		key = if pair then pair.key else nil,
+		value = if pair then pair.value else nil,
 		write = write,
 		read = read,
 	}) :: TypeDef
@@ -167,6 +551,17 @@ local function resolveTypeName(name: string): TypeDef?
 
 	if text then
 		return Malloc.Types.String(tonumber(text) :: number)
+	end
+
+	local mapKey, mapValue = string.match(name, "^Map<(.+),(.+)>$")
+
+	if mapKey and mapValue then
+		local resolvedKey = resolveTypeName(mapKey)
+		local resolvedValue = resolveTypeName(mapValue)
+
+		if resolvedKey and resolvedValue then
+			return Malloc.Types.Map(resolvedKey, resolvedValue)
+		end
 	end
 
 	return nil
@@ -511,6 +906,14 @@ local function assertAddress(self: Malloc, address: number): number
 		return size
 	end
 
+	if address == nil then
+		fail("no address was given, which usually means an allocation did not fit and returned nil")
+	end
+
+	if address == NULL then
+		fail("Malloc.NULL is a value used to clear a slot, not an address")
+	end
+
 	return fail("address " .. tostring(address) .. " is not a live allocation")
 end
 
@@ -531,6 +934,172 @@ local function resolveWindow(size: number, offset: number?, count: number?): (nu
 	end
 
 	return start, length
+end
+
+local function nextPowerOfTwo(value: number): number
+	local size = 1
+
+	while size < value do
+		size *= 2
+	end
+
+	return size
+end
+
+local function bitmapBytes(slots: number): number
+	return (slots + 7) // 8
+end
+
+local function dictSlots(entries: number): number
+	return math.max(DICT_MIN_SLOTS, math.ceil(entries / DICT_LOAD))
+end
+
+local function dictLimit(slots: number): number
+	return math.floor(slots * DICT_LOAD)
+end
+
+local function describeKind(kind: number): string
+	if kind == KIND_ARRAY then
+		return "an array"
+	elseif kind == KIND_DICT then
+		return "a dictionary"
+	end
+
+	return "a plain block"
+end
+
+local function blockKind(data: buffer, address: number): number
+	return bit32.band(buffer.readu8(data, address - HEADER_SIZE + HEADER_FLAGS), KIND_MASK)
+end
+
+local function markKind(data: buffer, address: number, kind: number, typeId: number)
+	local header = address - HEADER_SIZE
+
+	buffer.writeu8(data, header + HEADER_FLAGS, FLAG_USED + kind)
+	buffer.writeu8(data, header + HEADER_TYPE, typeId)
+end
+
+local function hashBytes(source: buffer, offset: number, length: number): number
+	local hash = 0
+
+	for index = 0, length - 1 do
+		hash = bit32.band(hash + buffer.readu8(source, offset + index), 0xFFFFFFFF)
+		hash = bit32.band(hash + bit32.lshift(hash, 10), 0xFFFFFFFF)
+		hash = bit32.bxor(hash, bit32.rshift(hash, 6))
+	end
+
+	hash = bit32.band(hash + bit32.lshift(hash, 3), 0xFFFFFFFF)
+	hash = bit32.bxor(hash, bit32.rshift(hash, 11))
+
+	return bit32.band(hash + bit32.lshift(hash, 15), 0xFFFFFFFF)
+end
+
+local function sameBytes(left: buffer, leftAt: number, right: buffer, rightAt: number, length: number): boolean
+	local index = 0
+
+	while index + 4 <= length do
+		if buffer.readu32(left, leftAt + index) ~= buffer.readu32(right, rightAt + index) then
+			return false
+		end
+
+		index += 4
+	end
+
+	while index < length do
+		if buffer.readu8(left, leftAt + index) ~= buffer.readu8(right, rightAt + index) then
+			return false
+		end
+
+		index += 1
+	end
+
+	return true
+end
+
+local scratch = buffer.create(64)
+
+local function encodeKey(definition: TypeDef, value: any): buffer
+	if buffer.len(scratch) < definition.size then
+		scratch = buffer.create(nextPowerOfTwo(definition.size))
+	end
+
+	buffer.fill(scratch, 0, 0, definition.size)
+	assertValue(definition, value)
+	definition.write(scratch, 0, value)
+
+	return scratch
+end
+
+local function slotTaken(data: buffer, bitmapAt: number, slot: number): boolean
+	return bit32.band(bit32.rshift(buffer.readu8(data, bitmapAt + slot // 8), slot % 8), 1) == 1
+end
+
+local function setSlot(data: buffer, bitmapAt: number, slot: number, taken: boolean)
+	local at = bitmapAt + slot // 8
+	local bit = bit32.lshift(1, slot % 8)
+	local byte = buffer.readu8(data, at)
+
+	buffer.writeu8(data, at, if taken then bit32.bor(byte, bit) else bit32.band(byte, bit32.bxor(0xFF, bit)))
+end
+
+local function arrayElement(data: buffer, address: number): TypeDef
+	local element = typesById[blockTypeId(data, address)]
+
+	if element == nil then
+		return fail("address " .. address .. " is an array with no element type")
+	end
+
+	return element
+end
+
+local function arrayCapacity(size: number, element: TypeDef): number
+	return (size - ARRAY_HEADER) // element.size
+end
+
+local function dictDefinition(data: buffer, address: number): TypeDef
+	local definition = typesById[blockTypeId(data, address)]
+
+	if definition and definition.key and definition.value then
+		return definition
+	end
+
+	return fail("address " .. address .. " is a dictionary with no key and value types")
+end
+
+local function dictLayout(data: buffer, address: number): (TypeDef, TypeDef, number, number, number, number)
+	local definition = dictDefinition(data, address)
+	local key = definition.key :: TypeDef
+	local value = definition.value :: TypeDef
+	local capacity = buffer.readu32(data, address + DICT_CAPACITY_AT)
+	local bitmapAt = address + DICT_HEADER
+	local keysAt = bitmapAt + bitmapBytes(capacity)
+
+	return key, value, capacity, bitmapAt, keysAt, keysAt + capacity * key.size
+end
+
+local function findSlot(
+	data: buffer,
+	bitmapAt: number,
+	keysAt: number,
+	capacity: number,
+	keySize: number,
+	probe: buffer
+): (number, boolean)
+	local slot = hashBytes(probe, 0, keySize) % capacity
+
+	for _ = 1, capacity do
+		if not slotTaken(data, bitmapAt, slot) then
+			return slot, false
+		end
+
+		if sameBytes(data, keysAt + slot * keySize, probe, 0, keySize) then
+			return slot, true
+		end
+
+		slot = (slot + 1) % capacity
+	end
+
+	return -1, false
 end
 
 local arenaClass = {}
@@ -577,6 +1146,10 @@ end
 
 function arenaClass.Realloc(self: Malloc, address: number, request: number | TypeDef, count: number?): number?
 	local size = assertAddress(self, address)
+
+	if blockKind(self.data, address) ~= KIND_PLAIN then
+		fail(("address %d is %s, use Grow"):format(address, describeKind(blockKind(self.data, address))))
+	end
 	local definition, wanted = resolveRequest(request, count)
 	local data, control = self.data, self.control
 	local typeId = if definition then definition.id else 0
@@ -628,6 +1201,10 @@ function arenaClass.Write(self: Malloc, address: number, value: any, index: numb
 	local size = assertAddress(self, address)
 	local definition = typesById[blockTypeId(self.data, address)]
 
+	if blockKind(self.data, address) ~= KIND_PLAIN then
+		fail(("address %d is %s, use Set or Push"):format(address, describeKind(blockKind(self.data, address))))
+	end
+
 	if definition == nil then
 		if value == NULL then
 			buffer.fill(self.data, address, 0, size)
@@ -656,6 +1233,10 @@ end
 function arenaClass.Read(self: Malloc, address: number, index: number?): any
 	local size = assertAddress(self, address)
 	local definition = typesById[blockTypeId(self.data, address)]
+
+	if blockKind(self.data, address) ~= KIND_PLAIN then
+		fail(("address %d is %s, use Get"):format(address, describeKind(blockKind(self.data, address))))
+	end
 
 	if definition == nil then
 		fail("address " .. address .. " is untyped, use ReadAs or ReadBytes")
@@ -784,7 +1365,18 @@ end
 
 function arenaClass.CountOf(self: Malloc, address: number): number
 	local size = assertAddress(self, address)
-	local definition = typesById[blockTypeId(self.data, address)]
+	local data = self.data
+	local kind = blockKind(data, address)
+
+	if kind == KIND_ARRAY then
+		return arrayCapacity(size, arrayElement(data, address))
+	end
+
+	if kind == KIND_DICT then
+		return dictLimit(buffer.readu32(data, address + DICT_CAPACITY_AT))
+	end
+
+	local definition = typesById[blockTypeId(data, address)]
 
 	return if definition then size // definition.size else size
 end
@@ -968,6 +1560,461 @@ function arenaClass.Export(self: Malloc): (buffer, buffer)
 	buffer.copy(image, 0, data, 0, imageLength)
 
 	return metadata, image
+end
+
+local function assertKind(self: Malloc, address: number, wanted: number): number
+	local size = assertAddress(self, address)
+	local kind = blockKind(self.data, address)
+
+	if kind ~= wanted then
+		fail(("address %d is %s, not %s"):format(address, describeKind(kind), describeKind(wanted)))
+	end
+
+	return size
+end
+
+local function arraySlot(data: buffer, address: number, element: TypeDef, index: number, length: number): number
+	local slot = math.floor(index)
+
+	if slot < 0 or slot >= length then
+		fail(("index %d falls outside an array of %d elements"):format(slot, length))
+	end
+
+	return address + ARRAY_HEADER + slot * element.size
+end
+
+local function dictSet(self: Malloc, address: number, key: any, value: any): boolean
+	local data = self.data
+	local keyType, valueType, capacity, bitmapAt, keysAt, valuesAt = dictLayout(data, address)
+	local probe = encodeKey(keyType, key)
+	local slot, found = findSlot(data, bitmapAt, keysAt, capacity, keyType.size, probe)
+
+	if slot < 0 then
+		return false
+	end
+
+	if not found then
+		local count = buffer.readu32(data, address + DICT_COUNT_AT)
+
+		if count >= dictLimit(capacity) then
+			return false
+		end
+
+		buffer.copy(data, keysAt + slot * keyType.size, probe, 0, keyType.size)
+		setSlot(data, bitmapAt, slot, true)
+		buffer.writeu32(data, address + DICT_COUNT_AT, count + 1)
+	end
+
+	local at = valuesAt + slot * valueType.size
+
+	if value == NULL then
+		buffer.fill(data, at, 0, valueType.size)
+	else
+		assertValue(valueType, value)
+		valueType.write(data, at, value)
+	end
+
+	return true
+end
+
+local function dictFind(self: Malloc, address: number, key: any): (number, boolean)
+	local data = self.data
+	local keyType, _valueType, capacity, bitmapAt, keysAt = dictLayout(data, address)
+
+	return findSlot(data, bitmapAt, keysAt, capacity, keyType.size, encodeKey(keyType, key))
+end
+
+local function dictRemove(self: Malloc, address: number, key: any): any
+	local data = self.data
+	local keyType, valueType, capacity, bitmapAt, keysAt, valuesAt = dictLayout(data, address)
+	local slot, found = findSlot(data, bitmapAt, keysAt, capacity, keyType.size, encodeKey(keyType, key))
+
+	if not found then
+		return nil
+	end
+
+	local keySize = keyType.size
+	local valueSize = valueType.size
+	local removed = valueType.read(data, valuesAt + slot * valueSize)
+	local hole = slot
+	local cursor = slot
+
+	for _ = 1, capacity do
+		cursor = (cursor + 1) % capacity
+
+		if not slotTaken(data, bitmapAt, cursor) then
+			break
+		end
+
+		local ideal = hashBytes(data, keysAt + cursor * keySize, keySize) % capacity
+		local movable
+
+		if cursor > hole then
+			movable = ideal <= hole or ideal > cursor
+		else
+			movable = ideal <= hole and ideal > cursor
+		end
+
+		if movable then
+			buffer.copy(data, keysAt + hole * keySize, data, keysAt + cursor * keySize, keySize)
+			buffer.copy(data, valuesAt + hole * valueSize, data, valuesAt + cursor * valueSize, valueSize)
+			hole = cursor
+		end
+	end
+
+	setSlot(data, bitmapAt, hole, false)
+	buffer.fill(data, keysAt + hole * keySize, 0, keySize)
+	buffer.fill(data, valuesAt + hole * valueSize, 0, valueSize)
+	buffer.writeu32(data, address + DICT_COUNT_AT, buffer.readu32(data, address + DICT_COUNT_AT) - 1)
+
+	return removed
+end
+
+function arenaClass.GenerateArray(self: Malloc, element: TypeDef, capacity: number): number?
+	assertDefinition(element)
+
+	local slots = math.floor(capacity)
+
+	if slots < 1 then
+		fail("an array needs room for at least one element")
+	end
+
+	local address = self:GenerateAddress(ARRAY_HEADER + slots * element.size)
+
+	if address then
+		markKind(self.data, address, KIND_ARRAY, element.id)
+	end
+
+	return address
+end
+
+function arenaClass.GenerateDictionary(self: Malloc, key: TypeDef, value: TypeDef, entries: number): number?
+	local definition = Malloc.Types.Map(key, value)
+	local wanted = math.floor(entries)
+
+	if wanted < 1 then
+		fail("a dictionary needs room for at least one entry")
+	end
+
+	local slots = dictSlots(wanted)
+	local address = self:GenerateAddress(DICT_HEADER + bitmapBytes(slots) + slots * definition.size)
+
+	if address then
+		markKind(self.data, address, KIND_DICT, definition.id)
+		buffer.writeu32(self.data, address + DICT_CAPACITY_AT, slots)
+	end
+
+	return address
+end
+
+function arenaClass.KindOf(self: Malloc, address: number): string
+	assertAddress(self, address)
+
+	local kind = blockKind(self.data, address)
+
+	return if kind == KIND_ARRAY then "array" elseif kind == KIND_DICT then "dictionary" else "plain"
+end
+
+function arenaClass.Length(self: Malloc, address: number): number
+	assertAddress(self, address)
+
+	local data = self.data
+	local kind = blockKind(data, address)
+
+	if kind == KIND_ARRAY then
+		return buffer.readu32(data, address + ARRAY_LENGTH_AT)
+	end
+
+	if kind == KIND_DICT then
+		return buffer.readu32(data, address + DICT_COUNT_AT)
+	end
+
+	return fail("address " .. address .. " is a plain block, use CountOf")
+end
+
+function arenaClass.Push(self: Malloc, address: number, value: any): number?
+	local size = assertKind(self, address, KIND_ARRAY)
+	local data = self.data
+	local element = arrayElement(data, address)
+	local length = buffer.readu32(data, address + ARRAY_LENGTH_AT)
+
+	if length >= arrayCapacity(size, element) then
+		return nil
+	end
+
+	local at = address + ARRAY_HEADER + length * element.size
+
+	if value == NULL then
+		buffer.fill(data, at, 0, element.size)
+	else
+		assertValue(element, value)
+		element.write(data, at, value)
+	end
+
+	buffer.writeu32(data, address + ARRAY_LENGTH_AT, length + 1)
+
+	return length
+end
+
+function arenaClass.Pop(self: Malloc, address: number): any
+	assertKind(self, address, KIND_ARRAY)
+
+	local data = self.data
+	local element = arrayElement(data, address)
+	local length = buffer.readu32(data, address + ARRAY_LENGTH_AT)
+
+	if length == 0 then
+		return nil
+	end
+
+	local at = address + ARRAY_HEADER + (length - 1) * element.size
+	local value = element.read(data, at)
+
+	buffer.fill(data, at, 0, element.size)
+	buffer.writeu32(data, address + ARRAY_LENGTH_AT, length - 1)
+
+	return value
+end
+
+function arenaClass.Get(self: Malloc, address: number, at: any): any
+	assertAddress(self, address)
+
+	local data = self.data
+	local kind = blockKind(data, address)
+
+	if kind == KIND_ARRAY then
+		local element = arrayElement(data, address)
+		local length = buffer.readu32(data, address + ARRAY_LENGTH_AT)
+
+		return element.read(data, arraySlot(data, address, element, at, length))
+	end
+
+	if kind == KIND_DICT then
+		local _keyType, valueType, _capacity, _bitmapAt, _keysAt, valuesAt = dictLayout(data, address)
+		local slot, found = dictFind(self, address, at)
+
+		if not found then
+			return nil
+		end
+
+		return valueType.read(data, valuesAt + slot * valueType.size)
+	end
+
+	return fail("address " .. address .. " is a plain block, use Read")
+end
+
+function arenaClass.Set(self: Malloc, address: number, at: any, value: any): boolean
+	assertAddress(self, address)
+
+	local data = self.data
+	local kind = blockKind(data, address)
+
+	if kind == KIND_ARRAY then
+		local element = arrayElement(data, address)
+		local length = buffer.readu32(data, address + ARRAY_LENGTH_AT)
+		local target = arraySlot(data, address, element, at, length)
+
+		if value == NULL then
+			buffer.fill(data, target, 0, element.size)
+		else
+			assertValue(element, value)
+			element.write(data, target, value)
+		end
+
+		return true
+	end
+
+	if kind == KIND_DICT then
+		return dictSet(self, address, at, value)
+	end
+
+	return fail("address " .. address .. " is a plain block, use Write")
+end
+
+function arenaClass.Has(self: Malloc, address: number, key: any): boolean
+	assertKind(self, address, KIND_DICT)
+
+	local _slot, found = dictFind(self, address, key)
+
+	return found
+end
+
+function arenaClass.Remove(self: Malloc, address: number, at: any): any
+	assertAddress(self, address)
+
+	local data = self.data
+	local kind = blockKind(data, address)
+
+	if kind == KIND_DICT then
+		return dictRemove(self, address, at)
+	end
+
+	if kind ~= KIND_ARRAY then
+		return fail("address " .. address .. " is a plain block, use Free")
+	end
+
+	local element = arrayElement(data, address)
+	local length = buffer.readu32(data, address + ARRAY_LENGTH_AT)
+	local target = arraySlot(data, address, element, at, length)
+	local removed = element.read(data, target)
+	local tail = address + ARRAY_HEADER + (length - 1) * element.size
+
+	if target < tail then
+		buffer.copy(data, target, data, target + element.size, tail - target)
+	end
+
+	buffer.fill(data, tail, 0, element.size)
+	buffer.writeu32(data, address + ARRAY_LENGTH_AT, length - 1)
+
+	return removed
+end
+
+function arenaClass.Clear(self: Malloc, address: number)
+	local size = assertAddress(self, address)
+	local data = self.data
+	local kind = blockKind(data, address)
+
+	if kind == KIND_ARRAY then
+		buffer.fill(data, address, 0, size)
+		return
+	end
+
+	if kind == KIND_DICT then
+		buffer.fill(data, address + DICT_HEADER, 0, size - DICT_HEADER)
+		buffer.writeu32(data, address + DICT_COUNT_AT, 0)
+
+		return
+	end
+
+	buffer.fill(data, address, 0, size)
+end
+
+function arenaClass.Iterate(self: Malloc, address: number, callback: (any, any) -> ())
+	assertAddress(self, address)
+
+	local data = self.data
+	local kind = blockKind(data, address)
+
+	if kind == KIND_ARRAY then
+		local element = arrayElement(data, address)
+		local length = buffer.readu32(data, address + ARRAY_LENGTH_AT)
+
+		for index = 0, length - 1 do
+			callback(index, element.read(data, address + ARRAY_HEADER + index * element.size))
+		end
+
+		return
+	end
+
+	if kind == KIND_DICT then
+		local keyType, valueType, capacity, bitmapAt, keysAt, valuesAt = dictLayout(data, address)
+
+		for slot = 0, capacity - 1 do
+			if slotTaken(data, bitmapAt, slot) then
+				callback(
+					keyType.read(data, keysAt + slot * keyType.size),
+					valueType.read(data, valuesAt + slot * valueType.size)
+				)
+			end
+		end
+
+		return
+	end
+
+	fail("address " .. address .. " is a plain block, use Read")
+end
+
+function arenaClass.Resize(self: Malloc, address: number, capacity: number): number?
+	assertAddress(self, address)
+
+	local data = self.data
+	local kind = blockKind(data, address)
+	local wanted = math.floor(capacity)
+
+	if kind == KIND_ARRAY then
+		if wanted < 1 then
+			fail("an array needs room for at least one element")
+		end
+
+		local element = arrayElement(data, address)
+		local length = buffer.readu32(data, address + ARRAY_LENGTH_AT)
+
+		if wanted < length then
+			buffer.fill(data, address + ARRAY_HEADER + wanted * element.size, 0, (length - wanted) * element.size)
+			buffer.writeu32(data, address + ARRAY_LENGTH_AT, wanted)
+		end
+
+		buffer.writeu8(data, address - HEADER_SIZE + HEADER_FLAGS, FLAG_USED)
+
+		local moved = self:Realloc(address, ARRAY_HEADER + wanted * element.size)
+
+		if moved == nil then
+			markKind(data, address, KIND_ARRAY, element.id)
+			return nil
+		end
+
+		markKind(data, moved, KIND_ARRAY, element.id)
+
+		return moved
+	end
+
+	if kind ~= KIND_DICT then
+		return fail("address " .. address .. " is a plain block, use Realloc")
+	end
+
+	if wanted < 1 then
+		fail("a dictionary needs room for at least one entry")
+	end
+
+	local keyType, valueType, oldCapacity, bitmapAt, keysAt, valuesAt = dictLayout(data, address)
+	local count = buffer.readu32(data, address + DICT_COUNT_AT)
+
+	if wanted < count then
+		fail(("cannot resize a dictionary holding %d entries down to %d, remove entries first"):format(count, wanted))
+	end
+
+	if dictSlots(wanted) == oldCapacity then
+		return address
+	end
+
+	local fresh = self:GenerateDictionary(keyType, valueType, wanted)
+
+	if fresh == nil then
+		return nil
+	end
+
+	for slot = 0, oldCapacity - 1 do
+		if slotTaken(data, bitmapAt, slot) then
+			dictSet(
+				self,
+				fresh,
+				keyType.read(data, keysAt + slot * keyType.size),
+				valueType.read(data, valuesAt + slot * valueType.size)
+			)
+		end
+	end
+
+	self:Free(address)
+
+	return fresh
+end
+
+function arenaClass.Grow(self: Malloc, address: number, capacity: number): number?
+	assertAddress(self, address)
+
+	local data = self.data
+	local kind = blockKind(data, address)
+	local wanted = math.floor(capacity)
+
+	if kind == KIND_ARRAY then
+		local length = buffer.readu32(data, address + ARRAY_LENGTH_AT)
+
+		if wanted < length then
+			fail(("Grow will not drop %d of %d array elements, use Resize"):format(length - wanted, length))
+		end
+	end
+
+	return self:Resize(address, capacity)
 end
 
 function arenaClass.Reset(self: Malloc)
@@ -1286,6 +2333,31 @@ Malloc.Types = table.freeze({
 		return NumberRange.new(buffer.readf32(target, offset), buffer.readf32(target, offset + 4))
 	end),
 
+	Map = function(key: TypeDef, value: TypeDef): TypeDef
+		assertDefinition(key)
+		assertDefinition(value)
+
+		local name = "Map<" .. key.name .. "," .. value.name .. ">"
+		local cached = typesByName[name]
+
+		if cached then
+			return cached
+		end
+
+		return defineType(
+			name,
+			key.size + value.size,
+			nil,
+			function(_target: buffer, _offset: number, _value: any)
+				fail("a dictionary is written through Set, not Write")
+			end,
+			function(_target: buffer, _offset: number): any
+				return fail("a dictionary is read through Get, not Read")
+			end,
+			{ key = key, value = value }
+		)
+	end,
+
 	Bytes = function(count: number): TypeDef
 		local capacity = math.floor(count)
 
@@ -1450,6 +2522,12 @@ function Malloc.Import(metadata: buffer, image: buffer): (Malloc, { number })
 		end
 
 		if isUsed(data, address) then
+			local kind = bit32.band(buffer.readu8(data, header + HEADER_FLAGS), KIND_MASK)
+
+			if kind ~= KIND_PLAIN and kind ~= KIND_ARRAY and kind ~= KIND_DICT then
+				fail("import image is corrupt: unknown block kind at " .. address)
+			end
+
 			usedBytes += size
 			live += 1
 		else
@@ -1537,6 +2615,34 @@ function Malloc.Reserve(request: number | TypeDef, count: number?): number
 	local _, wanted = resolveRequest(request, count)
 
 	return wanted + CHUNK_OVERHEAD
+end
+
+function Malloc.ReserveArray(element: TypeDef, capacity: number): number
+	assertDefinition(element)
+
+	local slots = math.floor(capacity)
+
+	if slots < 1 then
+		fail("an array needs room for at least one element")
+	end
+
+	return math.max(alignUp(ARRAY_HEADER + slots * element.size), MIN_PAYLOAD) + CHUNK_OVERHEAD
+end
+
+function Malloc.ReserveDictionary(key: TypeDef, value: TypeDef, entries: number): number
+	assertDefinition(key)
+	assertDefinition(value)
+
+	local wanted = math.floor(entries)
+
+	if wanted < 1 then
+		fail("a dictionary needs room for at least one entry")
+	end
+
+	local slots = dictSlots(wanted)
+	local payload = DICT_HEADER + bitmapBytes(slots) + slots * (key.size + value.size)
+
+	return math.max(alignUp(payload), MIN_PAYLOAD) + CHUNK_OVERHEAD
 end
 
 function Malloc.Is(value: any): boolean
