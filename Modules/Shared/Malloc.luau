@@ -250,12 +250,57 @@
 
 	SIZING AN ARENA
 
-	If you want an arena that is exactly big enough, add up what you plan
-	to put in it. These give the full cost including the 12 byte overhead.
+	KB, MB, and GB turn a friendly number into a byte count, so you do not
+	have to write the zeros out.
+
+		local arena = Malloc.Alloc(Malloc.MB(4))
+
+	They use 1024 to the step, the way memory is normally counted, so one
+	MB is 1048576 bytes and not a flat million.
+
+	If you want an arena that is exactly big enough instead, add up what
+	you plan to put in it. These give the full cost including the 12 byte
+	overhead.
 
 		Malloc.Reserve(Malloc.Types.Vector3, 10)
 		Malloc.ReserveArray(Malloc.Types.Vector3, 64)
 		Malloc.ReserveDictionary(Malloc.Types.String(16), Malloc.Types.F32, 100)
+
+	Format turns a byte count back into something you can read.
+
+		print(Malloc.Format(4194304))    4 MB
+		print(Malloc.Format(4000000))    3.81 MB
+		print(Malloc.Format(512))        512 B
+
+	It picks the unit for you and drops trailing zeros. Pass a second
+	number if you want a set number of decimal places.
+
+
+	CHECKING ON AN ARENA
+
+	Summary prints a readable report of where the memory went.
+
+		print(arena:Summary())
+
+		Malloc arena
+		  capacity       4 MB
+		  used           11.72 KB (0.3%)
+		  free           3.99 MB
+		  largest free   3.99 MB
+		  fragmentation  0.0%
+		  overhead       24 B across 2 chunks
+		  free chunks    1
+		  peak used      11.72 KB
+		  allocations    4
+		  frees          3
+
+	Usage is how full the arena is, from 0 to 1.
+
+	Fragmentation is how broken up the free space is, from 0 to 1. Zero
+	means all the free space is in one piece, so the largest thing you can
+	ask for is everything that is free. A high number means the free space
+	is scattered in small holes, and a big request will fail even though
+	the total looks like it should fit.
 
 
 	EVERYTHING YOU CAN CALL
@@ -270,6 +315,10 @@
 		Malloc.Reserve(type, count)                payload plus overhead
 		Malloc.ReserveArray(type, capacity)        cost of an array
 		Malloc.ReserveDictionary(key, value, n)    cost of a dictionary
+		Malloc.KB(count)                           count times 1024
+		Malloc.MB(count)                           count times 1048576
+		Malloc.GB(count)                           count times 1073741824
+		Malloc.Format(bytes, decimals)             "3.81 MB"
 		Malloc.Types                               the value types
 		Malloc.NULL                                the wipe value
 		Malloc.NULL_ADDRESS                        the number 0
@@ -326,7 +375,10 @@
 		arena:LargestFree()    biggest single free block
 		arena:Addresses()      every live address
 		arena:Each(callback)   walk every chunk, free ones included
-		arena:Stats()          a summary table
+		arena:Stats()          a table of numbers
+		arena:Summary()        the same thing as readable text
+		arena:Usage()          how full it is, 0 to 1
+		arena:Fragmentation()  how broken up the free space is, 0 to 1
 		arena:Export()         metadata and memory buffers
 		arena:Reset()          free everything, keep the arena
 		arena:Release()        free everything and drop the memory
@@ -409,6 +461,9 @@ export type Malloc = {
 	LargestFree: (self: Malloc) -> number,
 	Each: (self: Malloc, callback: (address: number, size: number, used: boolean, definition: TypeDef?) -> ()) -> (),
 	Stats: (self: Malloc) -> Stats,
+	Usage: (self: Malloc) -> number,
+	Fragmentation: (self: Malloc) -> number,
+	Summary: (self: Malloc) -> string,
 	Addresses: (self: Malloc) -> { number },
 	Export: (self: Malloc) -> (buffer, buffer),
 
@@ -2017,6 +2072,49 @@ function arenaClass.Grow(self: Malloc, address: number, capacity: number): numbe
 	return self:Resize(address, capacity)
 end
 
+function arenaClass.Usage(self: Malloc): number
+	local capacity = self:Capacity()
+
+	if capacity == 0 then
+		return 0
+	end
+
+	return self:Used() / capacity
+end
+
+function arenaClass.Fragmentation(self: Malloc): number
+	local free = self:Available()
+
+	if free == 0 then
+		return 0
+	end
+
+	return 1 - self:LargestFree() / free
+end
+
+function arenaClass.Summary(self: Malloc): string
+	if self.released then
+		return "Malloc arena (released)"
+	end
+
+	local stats = self:Stats()
+	local lines = {
+		"Malloc arena",
+		("  capacity       %s"):format(Malloc.Format(stats.capacity)),
+		("  used           %s (%.1f%%)"):format(Malloc.Format(stats.used), self:Usage() * 100),
+		("  free           %s"):format(Malloc.Format(stats.free)),
+		("  largest free   %s"):format(Malloc.Format(stats.largestFree)),
+		("  fragmentation  %.1f%%"):format(self:Fragmentation() * 100),
+		("  overhead       %s across %d chunks"):format(Malloc.Format(stats.overhead), stats.blocks),
+		("  free chunks    %d"):format(stats.fragments),
+		("  peak used      %s"):format(Malloc.Format(stats.peak)),
+		("  allocations    %d"):format(stats.allocations),
+		("  frees          %d"):format(stats.frees),
+	}
+
+	return table.concat(lines, "\n")
+end
+
 function arenaClass.Reset(self: Malloc)
 	if self.released then
 		fail("this arena has been released")
@@ -2433,6 +2531,56 @@ Malloc.Types = table.freeze({
 Malloc.NULL = NULL
 Malloc.NULL_ADDRESS = NULL_ADDRESS
 Malloc.Overhead = CHUNK_OVERHEAD
+
+local SIZE_UNITS = { "B", "KB", "MB", "GB", "TB" }
+
+local function sizeArgument(count: number, unit: string): number
+	if type(count) ~= "number" or count ~= count or count < 0 then
+		fail(unit .. " needs a count of zero or more, got " .. tostring(count))
+	end
+
+	return count
+end
+
+function Malloc.KB(count: number): number
+	return math.floor(sizeArgument(count, "KB") * 1024)
+end
+
+function Malloc.MB(count: number): number
+	return math.floor(sizeArgument(count, "MB") * 1048576)
+end
+
+function Malloc.GB(count: number): number
+	return math.floor(sizeArgument(count, "GB") * 1073741824)
+end
+
+function Malloc.Format(bytes: number, decimals: number?): string
+	if type(bytes) ~= "number" or bytes ~= bytes then
+		fail("Format needs a number of bytes, got " .. tostring(bytes))
+	end
+
+	local places = if decimals ~= nil then math.clamp(math.floor(decimals), 0, 6) else 2
+	local amount = math.abs(bytes)
+	local unit = 1
+
+	while amount >= 1024 and unit < #SIZE_UNITS do
+		amount /= 1024
+		unit += 1
+	end
+
+	if unit == 1 then
+		return ("%d %s"):format(math.floor(bytes), SIZE_UNITS[1])
+	end
+
+	local text = ("%." .. places .. "f"):format(if bytes < 0 then -amount else amount)
+
+	if string.find(text, "%.", 1, false) then
+		text = string.gsub(text, "0+$", "")
+		text = string.gsub(text, "%.$", "")
+	end
+
+	return text .. " " .. SIZE_UNITS[unit]
+end
 
 function Malloc.IsNull(value: any): boolean
 	return value == nil or value == NULL or value == NULL_ADDRESS
