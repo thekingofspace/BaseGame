@@ -1,0 +1,7 @@
+enum NetworkStatus {
+    OK;
+    Recieved;
+    Bad;
+    Debounced;
+    Failed;
+}
