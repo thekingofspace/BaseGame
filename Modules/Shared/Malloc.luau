@@ -92,8 +92,8 @@
 	Two of them are built at the moment you ask for them, so that you can
 	pick the size.
 
-		Malloc.Types.Bytes(16)    raw bytes, holds a buffer or a string
 		Malloc.Types.String(16)   text up to 16 characters
+		Malloc.Types.Bytes(16)    16 bytes that will hold anything
 
 	The rotation types are worth knowing about because they trade accuracy
 	for space.
@@ -121,6 +121,65 @@
 	The last number is the slot, counting from 0. You can also ignore the
 	block type and read or write any type at any byte offset with WriteAs
 	and ReadAs.
+
+
+	A BLOCK THAT HOLDS ANYTHING
+
+	Bytes is different from the others. The number you give it is just the
+	size of the block. You do not say what goes in it, you just put things
+	in and it works out the smallest way to store each one.
+
+		local slot = arena:GenerateAddress(Malloc.Types.Bytes(24))
+
+		arena:Write(slot, "hello")
+		arena:Write(slot, 42)
+		arena:Write(slot, Vector3.new(1, 2, 3))
+		arena:Write(slot, CFrame.new(10, 20, 30))
+		arena:Write(slot, true)
+
+	Reading gives you back what you put in, as the same kind of thing you
+	put in. The first byte of the block records which shape was used, and
+	the rest holds the value.
+
+	Because it picks the shape from the value, small things stay small.
+
+		nil, true, false, the number 0    1 byte
+		a whole number up to 255          2 bytes
+		a whole number up to 65535        3 bytes
+		a decimal that fits in f32        5 bytes
+		any other number                  9 bytes
+		a Vector3 of whole numbers        7 bytes
+		any other Vector3                13 bytes
+		a CFrame with no turn or move     1 byte
+		a CFrame that is only moved      13 bytes
+		a CFrame with a turn             17 bytes
+		a Color3                          4 bytes
+		text                              2 bytes plus the letters
+		a buffer                          2 bytes plus the bytes
+
+	Measure tells you how many bytes a value needs, so you can pick a size
+	that will always fit.
+
+		print(Malloc.Measure(CFrame.new(1, 2, 3)))
+
+	If a value will not fit in the block you get a clear error naming the
+	size it needed. Note that a UDim2 needs 17 bytes, so a block of 16 is
+	not enough for one.
+
+	Writing Malloc.NULL to one of these blocks empties it, and reading an
+	empty one gives nil.
+
+	This works for array items and for dictionary keys and values too, so
+	you can hold a mixed bag in one place.
+
+		local list = arena:GenerateArray(Malloc.Types.Bytes(24), 10)
+
+		arena:Push(list, "text")
+		arena:Push(list, 42)
+		arena:Push(list, Vector3.new(1, 2, 3))
+
+	When you want raw bytes and nothing clever, put a buffer in and you
+	will get a buffer back out.
 
 
 	MALLOC.NULL
@@ -319,6 +378,7 @@
 		Malloc.MB(count)                           count times 1048576
 		Malloc.GB(count)                           count times 1073741824
 		Malloc.Format(bytes, decimals)             "3.81 MB"
+		Malloc.Measure(value)                      bytes a value needs
 		Malloc.Types                               the value types
 		Malloc.NULL                                the wipe value
 		Malloc.NULL_ADDRESS                        the number 0
@@ -557,6 +617,14 @@ table.freeze(NULL)
 
 local function fail(message: string): never
 	return error("[Malloc] " .. message, 3)
+end
+
+local function countArgument(value: any, what: string): number
+	if type(value) ~= "number" or value ~= value then
+		fail(what .. ", got " .. typeof(value))
+	end
+
+	return math.floor(value)
 end
 
 local function defineType(
@@ -1728,7 +1796,7 @@ end
 function arenaClass.GenerateArray(self: Malloc, element: TypeDef, capacity: number): number?
 	assertDefinition(element)
 
-	local slots = math.floor(capacity)
+	local slots = countArgument(capacity, "GenerateArray needs a capacity, as in GenerateArray(type, 64)")
 
 	if slots < 1 then
 		fail("an array needs room for at least one element")
@@ -1744,12 +1812,16 @@ function arenaClass.GenerateArray(self: Malloc, element: TypeDef, capacity: numb
 end
 
 function arenaClass.GenerateDictionary(self: Malloc, key: TypeDef, value: TypeDef, entries: number): number?
-	local definition = Malloc.Types.Map(key, value)
-	local wanted = math.floor(entries)
+	local wanted = countArgument(
+		entries,
+		"GenerateDictionary needs an entry count, as in GenerateDictionary(keyType, valueType, 100)"
+	)
 
 	if wanted < 1 then
 		fail("a dictionary needs room for at least one entry")
 	end
+
+	local definition = Malloc.Types.Map(key, value)
 
 	local slots = dictSlots(wanted)
 	local address = self:GenerateAddress(DICT_HEADER + bitmapBytes(slots) + slots * definition.size)
@@ -1984,7 +2056,7 @@ function arenaClass.Resize(self: Malloc, address: number, capacity: number): num
 
 	local data = self.data
 	local kind = blockKind(data, address)
-	local wanted = math.floor(capacity)
+	local wanted = countArgument(capacity, "Resize needs a capacity, as in Resize(address, 64)")
 
 	if kind == KIND_ARRAY then
 		if wanted < 1 then
@@ -2059,7 +2131,7 @@ function arenaClass.Grow(self: Malloc, address: number, capacity: number): numbe
 
 	local data = self.data
 	local kind = blockKind(data, address)
-	local wanted = math.floor(capacity)
+	local wanted = countArgument(capacity, "Grow needs a capacity, as in Grow(address, 64)")
 
 	if kind == KIND_ARRAY then
 		local length = buffer.readu32(data, address + ARRAY_LENGTH_AT)
@@ -2148,31 +2220,382 @@ end
 local bytesTypes: { [number]: TypeDef } = {}
 local stringTypes: { [number]: TypeDef } = {}
 
-local function writeRaw(target: buffer, offset: number, value: any, capacity: number)
-	local kind = typeof(value)
-	local length = 0
-
-	if kind == "string" then
-		length = math.min(#value, capacity)
-		buffer.writestring(target, offset, value, length)
-	elseif kind == "buffer" then
-		length = math.min(buffer.len(value), capacity)
-		buffer.copy(target, offset, value, 0, length)
-	else
-		fail("Bytes values must be a buffer or string, got " .. kind)
-	end
-
-	if length < capacity then
-		buffer.fill(target, offset + length, 0, capacity - length)
-	end
-end
-
-local function writeQuaternion(target: buffer, offset: number, value: any)
+local function cframeRotation(value: any): number
 	local axis, angle = value:ToAxisAngle()
 	local half = angle * 0.5
 	local sine = math.sin(half)
 
-	buffer.writeu32(target, offset, packQuaternion(axis.X * sine, axis.Y * sine, axis.Z * sine, math.cos(half)))
+	return packQuaternion(axis.X * sine, axis.Y * sine, axis.Z * sine, math.cos(half))
+end
+
+local function writeQuaternion(target: buffer, offset: number, value: any)
+	buffer.writeu32(target, offset, cframeRotation(value))
+end
+
+local TAG = table.freeze({
+	EMPTY = 0,
+	FALSE = 1,
+	TRUE = 2,
+	ZERO = 3,
+	U8 = 4,
+	I8 = 5,
+	U16 = 6,
+	I16 = 7,
+	U32 = 8,
+	I32 = 9,
+	F32 = 10,
+	F64 = 11,
+	TEXT8 = 12,
+	TEXT16 = 13,
+	RAW8 = 14,
+	RAW16 = 15,
+	VECTOR2_WHOLE = 16,
+	VECTOR2 = 17,
+	VECTOR3_WHOLE = 18,
+	VECTOR3 = 19,
+	CFRAME_NONE = 20,
+	CFRAME_MOVE = 21,
+	CFRAME_FULL = 22,
+	COLOR3 = 23,
+	UDIM = 24,
+	UDIM2 = 25,
+	RECT = 26,
+	RANGE = 27,
+})
+
+local valueProbe = buffer.create(8)
+
+local function isWholeI16(value: number): boolean
+	return value % 1 == 0 and value >= -32768 and value <= 32767
+end
+
+local function unsupportedValue(kind: string): number
+	return fail("a sized block cannot store a " .. kind)
+end
+
+local function valueTag(value: any): (number, number)
+	local kind = typeof(value)
+
+	if kind == "number" then
+		if value == 0 then
+			return TAG.ZERO, 0
+		end
+
+		if value % 1 == 0 then
+			if value > 0 then
+				if value <= 255 then
+					return TAG.U8, 1
+				end
+
+				if value <= 65535 then
+					return TAG.U16, 2
+				end
+
+				if value <= 4294967295 then
+					return TAG.U32, 4
+				end
+			else
+				if value >= -128 then
+					return TAG.I8, 1
+				end
+
+				if value >= -32768 then
+					return TAG.I16, 2
+				end
+
+				if value >= -2147483648 then
+					return TAG.I32, 4
+				end
+			end
+		end
+
+		buffer.writef32(valueProbe, 0, value)
+
+		if buffer.readf32(valueProbe, 0) == value then
+			return TAG.F32, 4
+		end
+
+		return TAG.F64, 8
+	end
+
+	if kind == "string" then
+		if #value <= 255 then
+			return TAG.TEXT8, 1 + #value
+		end
+
+		return TAG.TEXT16, 2 + #value
+	end
+
+	if kind == "boolean" then
+		return (if value then TAG.TRUE else TAG.FALSE), 0
+	end
+
+	if kind == "nil" then
+		return TAG.EMPTY, 0
+	end
+
+	if kind == "Vector3" then
+		if isWholeI16(value.X) and isWholeI16(value.Y) and isWholeI16(value.Z) then
+			return TAG.VECTOR3_WHOLE, 6
+		end
+
+		return TAG.VECTOR3, 12
+	end
+
+	if kind == "CFrame" then
+		if cframeRotation(value) == 0 then
+			local position = value.Position
+
+			if position.X == 0 and position.Y == 0 and position.Z == 0 then
+				return TAG.CFRAME_NONE, 0
+			end
+
+			return TAG.CFRAME_MOVE, 12
+		end
+
+		return TAG.CFRAME_FULL, 16
+	end
+
+	if kind == "Vector2" then
+		if isWholeI16(value.X) and isWholeI16(value.Y) then
+			return TAG.VECTOR2_WHOLE, 4
+		end
+
+		return TAG.VECTOR2, 8
+	end
+
+	if kind == "Color3" then
+		return TAG.COLOR3, 3
+	end
+
+	if kind == "buffer" then
+		local length = buffer.len(value)
+
+		if length <= 255 then
+			return TAG.RAW8, 1 + length
+		end
+
+		return TAG.RAW16, 2 + length
+	end
+
+	if kind == "UDim" then
+		return TAG.UDIM, 8
+	end
+
+	if kind == "UDim2" then
+		return TAG.UDIM2, 16
+	end
+
+	if kind == "Rect" then
+		return TAG.RECT, 16
+	end
+
+	if kind == "NumberRange" then
+		return TAG.RANGE, 8
+	end
+
+	return unsupportedValue(kind), 0
+end
+
+local function writeValue(target: buffer, offset: number, value: any, capacity: number)
+	local tag, size = valueTag(value)
+
+	if size + 1 > capacity then
+		fail(("a %d byte block cannot hold this %s, it needs %d bytes"):format(capacity, typeof(value), size + 1))
+	end
+
+	buffer.writeu8(target, offset, tag)
+	buffer.fill(target, offset + 1, 0, capacity - 1)
+
+	local at = offset + 1
+
+	if tag == TAG.U8 then
+		buffer.writeu8(target, at, value)
+	elseif tag == TAG.I8 then
+		buffer.writei8(target, at, value)
+	elseif tag == TAG.U16 then
+		buffer.writeu16(target, at, value)
+	elseif tag == TAG.I16 then
+		buffer.writei16(target, at, value)
+	elseif tag == TAG.U32 then
+		buffer.writeu32(target, at, value)
+	elseif tag == TAG.I32 then
+		buffer.writei32(target, at, value)
+	elseif tag == TAG.F32 then
+		buffer.writef32(target, at, value)
+	elseif tag == TAG.F64 then
+		buffer.writef64(target, at, value)
+	elseif tag == TAG.TEXT8 then
+		buffer.writeu8(target, at, #value)
+		buffer.writestring(target, at + 1, value)
+	elseif tag == TAG.TEXT16 then
+		buffer.writeu16(target, at, #value)
+		buffer.writestring(target, at + 2, value)
+	elseif tag == TAG.RAW8 then
+		buffer.writeu8(target, at, buffer.len(value))
+		buffer.copy(target, at + 1, value, 0, buffer.len(value))
+	elseif tag == TAG.RAW16 then
+		buffer.writeu16(target, at, buffer.len(value))
+		buffer.copy(target, at + 2, value, 0, buffer.len(value))
+	elseif tag == TAG.VECTOR3_WHOLE then
+		buffer.writei16(target, at, value.X)
+		buffer.writei16(target, at + 2, value.Y)
+		buffer.writei16(target, at + 4, value.Z)
+	elseif tag == TAG.VECTOR3 then
+		buffer.writef32(target, at, value.X)
+		buffer.writef32(target, at + 4, value.Y)
+		buffer.writef32(target, at + 8, value.Z)
+	elseif tag == TAG.VECTOR2_WHOLE then
+		buffer.writei16(target, at, value.X)
+		buffer.writei16(target, at + 2, value.Y)
+	elseif tag == TAG.VECTOR2 then
+		buffer.writef32(target, at, value.X)
+		buffer.writef32(target, at + 4, value.Y)
+	elseif tag == TAG.CFRAME_MOVE then
+		local position = value.Position
+
+		buffer.writef32(target, at, position.X)
+		buffer.writef32(target, at + 4, position.Y)
+		buffer.writef32(target, at + 8, position.Z)
+	elseif tag == TAG.CFRAME_FULL then
+		local position = value.Position
+
+		buffer.writef32(target, at, position.X)
+		buffer.writef32(target, at + 4, position.Y)
+		buffer.writef32(target, at + 8, position.Z)
+		buffer.writeu32(target, at + 12, cframeRotation(value))
+	elseif tag == TAG.COLOR3 then
+		buffer.writeu8(target, at, math.clamp(math.round(value.R * 255), 0, 255))
+		buffer.writeu8(target, at + 1, math.clamp(math.round(value.G * 255), 0, 255))
+		buffer.writeu8(target, at + 2, math.clamp(math.round(value.B * 255), 0, 255))
+	elseif tag == TAG.UDIM then
+		buffer.writef32(target, at, value.Scale)
+		buffer.writei32(target, at + 4, value.Offset)
+	elseif tag == TAG.UDIM2 then
+		buffer.writef32(target, at, value.X.Scale)
+		buffer.writei32(target, at + 4, value.X.Offset)
+		buffer.writef32(target, at + 8, value.Y.Scale)
+		buffer.writei32(target, at + 12, value.Y.Offset)
+	elseif tag == TAG.RECT then
+		buffer.writef32(target, at, value.Min.X)
+		buffer.writef32(target, at + 4, value.Min.Y)
+		buffer.writef32(target, at + 8, value.Max.X)
+		buffer.writef32(target, at + 12, value.Max.Y)
+	elseif tag == TAG.RANGE then
+		buffer.writef32(target, at, value.Min)
+		buffer.writef32(target, at + 4, value.Max)
+	end
+end
+
+local function readValue(target: buffer, offset: number): any
+	local tag = buffer.readu8(target, offset)
+	local at = offset + 1
+
+	if tag == TAG.EMPTY then
+		return nil
+	elseif tag == TAG.ZERO then
+		return 0
+	elseif tag == TAG.TRUE then
+		return true
+	elseif tag == TAG.FALSE then
+		return false
+	elseif tag == TAG.U8 then
+		return buffer.readu8(target, at)
+	elseif tag == TAG.I8 then
+		return buffer.readi8(target, at)
+	elseif tag == TAG.U16 then
+		return buffer.readu16(target, at)
+	elseif tag == TAG.I16 then
+		return buffer.readi16(target, at)
+	elseif tag == TAG.U32 then
+		return buffer.readu32(target, at)
+	elseif tag == TAG.I32 then
+		return buffer.readi32(target, at)
+	elseif tag == TAG.F32 then
+		return buffer.readf32(target, at)
+	elseif tag == TAG.F64 then
+		return buffer.readf64(target, at)
+	elseif tag == TAG.TEXT8 then
+		return buffer.readstring(target, at + 1, buffer.readu8(target, at))
+	elseif tag == TAG.TEXT16 then
+		return buffer.readstring(target, at + 2, buffer.readu16(target, at))
+	elseif tag == TAG.RAW8 then
+		local length = buffer.readu8(target, at)
+		local out = buffer.create(length)
+
+		buffer.copy(out, 0, target, at + 1, length)
+
+		return out
+	elseif tag == TAG.RAW16 then
+		local length = buffer.readu16(target, at)
+		local out = buffer.create(length)
+
+		buffer.copy(out, 0, target, at + 2, length)
+
+		return out
+	elseif tag == TAG.VECTOR3_WHOLE then
+		return Vector3.new(
+			buffer.readi16(target, at),
+			buffer.readi16(target, at + 2),
+			buffer.readi16(target, at + 4)
+		)
+	elseif tag == TAG.VECTOR3 then
+		return Vector3.new(
+			buffer.readf32(target, at),
+			buffer.readf32(target, at + 4),
+			buffer.readf32(target, at + 8)
+		)
+	elseif tag == TAG.VECTOR2_WHOLE then
+		return Vector2.new(buffer.readi16(target, at), buffer.readi16(target, at + 2))
+	elseif tag == TAG.VECTOR2 then
+		return Vector2.new(buffer.readf32(target, at), buffer.readf32(target, at + 4))
+	elseif tag == TAG.CFRAME_NONE then
+		return CFrame.new()
+	elseif tag == TAG.CFRAME_MOVE then
+		return CFrame.new(
+			buffer.readf32(target, at),
+			buffer.readf32(target, at + 4),
+			buffer.readf32(target, at + 8)
+		)
+	elseif tag == TAG.CFRAME_FULL then
+		local x, y, z, w = unpackQuaternion(buffer.readu32(target, at + 12))
+
+		return CFrame.new(
+			buffer.readf32(target, at),
+			buffer.readf32(target, at + 4),
+			buffer.readf32(target, at + 8),
+			x,
+			y,
+			z,
+			w
+		)
+	elseif tag == TAG.COLOR3 then
+		return Color3.fromRGB(
+			buffer.readu8(target, at),
+			buffer.readu8(target, at + 1),
+			buffer.readu8(target, at + 2)
+		)
+	elseif tag == TAG.UDIM then
+		return UDim.new(buffer.readf32(target, at), buffer.readi32(target, at + 4))
+	elseif tag == TAG.UDIM2 then
+		return UDim2.new(
+			buffer.readf32(target, at),
+			buffer.readi32(target, at + 4),
+			buffer.readf32(target, at + 8),
+			buffer.readi32(target, at + 12)
+		)
+	elseif tag == TAG.RECT then
+		return Rect.new(
+			buffer.readf32(target, at),
+			buffer.readf32(target, at + 4),
+			buffer.readf32(target, at + 8),
+			buffer.readf32(target, at + 12)
+		)
+	elseif tag == TAG.RANGE then
+		return NumberRange.new(buffer.readf32(target, at), buffer.readf32(target, at + 4))
+	end
+
+	return fail("a sized block holds an unknown value marker " .. tag)
 end
 
 local scalarTypes = {
@@ -2457,7 +2880,7 @@ Malloc.Types = table.freeze({
 	end,
 
 	Bytes = function(count: number): TypeDef
-		local capacity = math.floor(count)
+		local capacity = countArgument(count, "Bytes needs a size, as in Bytes(16)")
 
 		if capacity < 1 then
 			fail("Bytes needs a capacity of at least 1")
@@ -2474,14 +2897,10 @@ Malloc.Types = table.freeze({
 			capacity,
 			nil,
 			function(target: buffer, offset: number, value: any)
-				writeRaw(target, offset, value, capacity)
+				writeValue(target, offset, value, capacity)
 			end,
 			function(target: buffer, offset: number): any
-				local out = buffer.create(capacity)
-
-				buffer.copy(out, 0, target, offset, capacity)
-
-				return out
+				return readValue(target, offset)
 			end
 		)
 
@@ -2491,7 +2910,7 @@ Malloc.Types = table.freeze({
 	end,
 
 	String = function(count: number): TypeDef
-		local capacity = math.floor(count)
+		local capacity = countArgument(count, "String needs a size, as in String(16)")
 
 		if capacity < 1 or capacity > 65535 then
 			fail("String needs a capacity between 1 and 65535")
@@ -2768,7 +3187,7 @@ end
 function Malloc.ReserveArray(element: TypeDef, capacity: number): number
 	assertDefinition(element)
 
-	local slots = math.floor(capacity)
+	local slots = countArgument(capacity, "ReserveArray needs a capacity, as in ReserveArray(type, 64)")
 
 	if slots < 1 then
 		fail("an array needs room for at least one element")
@@ -2781,7 +3200,10 @@ function Malloc.ReserveDictionary(key: TypeDef, value: TypeDef, entries: number)
 	assertDefinition(key)
 	assertDefinition(value)
 
-	local wanted = math.floor(entries)
+	local wanted = countArgument(
+		entries,
+		"ReserveDictionary needs an entry count, as in ReserveDictionary(keyType, valueType, 100)"
+	)
 
 	if wanted < 1 then
 		fail("a dictionary needs room for at least one entry")
@@ -2791,6 +3213,12 @@ function Malloc.ReserveDictionary(key: TypeDef, value: TypeDef, entries: number)
 	local payload = DICT_HEADER + bitmapBytes(slots) + slots * (key.size + value.size)
 
 	return math.max(alignUp(payload), MIN_PAYLOAD) + CHUNK_OVERHEAD
+end
+
+function Malloc.Measure(value: any): number
+	local _tag, size = valueTag(value)
+
+	return size + 1
 end
 
 function Malloc.Is(value: any): boolean
